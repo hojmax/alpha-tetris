@@ -750,3 +750,66 @@ fn bench_heads_latency_probe() {
         );
     }
 }
+
+/// Native heads vs an independent f64 forward pass on real states
+/// (`TETRIS_BENCH_MODEL=<bundle>.onnx`).
+#[test]
+#[ignore]
+fn native_heads_match_f64_reference_on_real_states() {
+    let Ok(model_path) = std::env::var("TETRIS_BENCH_MODEL") else {
+        eprintln!("TETRIS_BENCH_MODEL not set");
+        return;
+    };
+    let nn = TetrisNN::load(&model_path).expect("load");
+    let heads_path = Path::new(&model_path).with_extension("heads.onnx");
+    let (weights, aux_layers, blocks) = heads::reference::load_weights(&heads_path);
+    let mut scratch = nn.heads.new_scratch();
+    let mut board_input = vec![0.0; nn.heads.board_fusion_width()];
+    let (mut max_value_rel, mut max_logit_abs, mut max_prob_abs) = (0.0f64, 0.0f64, 0.0f64);
+    let mut states = 0;
+    for seed in 0..40u64 {
+        let mut env = TetrisEnv::with_seed(10, 20, 3000 + seed);
+        for step in 0..50usize {
+            if env.game_over {
+                break;
+            }
+            let valid = env.get_cached_valid_action_indices_arc().to_vec();
+            if valid.is_empty() {
+                break;
+            }
+            let board_h = nn
+                .compute_board_embedding(&encode_board_features(&env), &encode_board_stats(&env))
+                .unwrap();
+            let board_h = board_h.as_slice().unwrap();
+            let aux = encode_piece_aux_features(&env, 50).unwrap();
+            nn.heads
+                .board_fusion_input(board_h, &mut scratch, &mut board_input);
+            let value = nn.heads.forward_trunk(&board_input, &aux, &mut scratch);
+            let logits = nn.heads.all_policy_logits(&scratch);
+            let (ref_logits, ref_value) =
+                heads::reference::forward(&weights, aux_layers, blocks, board_h, &aux);
+
+            max_value_rel =
+                max_value_rel.max((f64::from(value) - ref_value).abs() / (1.0 + ref_value.abs()));
+            for (&got, &want) in logits.iter().zip(&ref_logits) {
+                max_logit_abs = max_logit_abs.max((f64::from(got) - want).abs());
+            }
+            let ref_max = valid
+                .iter()
+                .map(|&a| ref_logits[a])
+                .fold(f64::MIN, f64::max);
+            let ref_sum: f64 = valid.iter().map(|&a| (ref_logits[a] - ref_max).exp()).sum();
+            let probs = softmax_over_valid_actions(&logits, &valid);
+            for (&a, &p) in valid.iter().zip(&probs) {
+                let want = (ref_logits[a] - ref_max).exp() / ref_sum;
+                max_prob_abs = max_prob_abs.max((f64::from(p) - want).abs());
+            }
+            states += 1;
+            env.execute_action_index(valid[(step * 7 + seed as usize) % valid.len()]);
+        }
+    }
+    eprintln!(
+        "native vs f64 reference over {states} states: value max rel {max_value_rel:.2e}, logit max abs {max_logit_abs:.2e}, prob max abs {max_prob_abs:.2e}"
+    );
+    assert!(max_value_rel < 1e-4 && max_logit_abs < 1e-3 && max_prob_abs < 1e-4);
+}

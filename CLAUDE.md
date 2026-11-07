@@ -184,7 +184,8 @@ Disk note:
 
 1. Edit `tetris_bot/ml/network.py`.
 2. Update Rust inference encoding in `tetris_core/src/inference/mod.rs` if feature schema changes.
-3. Retrain/export ONNX artifacts.
+3. If the heads part changes (aux MLP, board/aux concatenation + `fusion_fc`, residual fusion blocks, policy/value heads), update the native heads in `tetris_core/src/inference/heads.rs`; it reads `X.heads.onnx` initializers by PyTorch parameter name and fails loudly on any unexpected graph structure.
+4. Retrain/export ONNX artifacts.
 
 ### Train / Resume
 
@@ -215,7 +216,7 @@ make optimize
 ```
 
 Set `MODEL_PROFILE=<existing-onnx-path>` when the Makefile default model path is missing.
-Set `TETRIS_NN_BACKEND=ort` to profile ONNX Runtime instead of default `tract`.
+Set `TETRIS_NN_BACKEND=ort` to profile ONNX Runtime instead of default `tract` (conv model only; the heads always run natively).
 `make optimize` is fast by default; for an exhaustive sweep: `make optimize OPT_BACKEND_STRATEGY=exhaustive OPT_WORKER_SEARCH=grid OPT_GAMES=40 OPT_SIMS=500`.
 Results written to `benchmarks/profiles/optimize_cache/<machine_fingerprint>.env`; `make train` computes the current machine fingerprint and loads the matching env (runs optimize first if missing).
 Do NOT use `maturin develop` — use `maturin build --out tetris_core/dist` then `$(PYTHON) -m pip install` (respects `.venv` `sys.prefix` correctly).

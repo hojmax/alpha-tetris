@@ -661,6 +661,107 @@ impl<'a> WeightReader<'a> {
     }
 }
 
+/// Independent f64 implementation of the heads used to check the native kernels.
+#[cfg(test)]
+pub(super) mod reference {
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    use super::super::heads_onnx::parse_model_graph;
+
+    /// PyTorch-named weights of a heads ONNX file (Identity aliases resolved), plus the
+    /// number of aux_mlp layers and residual fusion blocks.
+    pub(in crate::inference) fn load_weights(
+        path: &Path,
+    ) -> (HashMap<String, Vec<f32>>, usize, usize) {
+        let graph =
+            parse_model_graph(&std::fs::read(path).expect("read heads model")).expect("parse");
+        let mut weights: HashMap<String, Vec<f32>> = graph
+            .initializers
+            .iter()
+            .map(|(name, tensor)| (name.clone(), tensor.data.clone()))
+            .collect();
+        for node in graph.nodes.iter().filter(|node| node.op_type == "Identity") {
+            let data = weights[&node.inputs[0]].clone();
+            weights.insert(node.outputs[0].clone(), data);
+        }
+        let aux_layers = (0..)
+            .take_while(|i| weights.contains_key(&format!("aux_mlp.{}.weight", 3 * i)))
+            .count();
+        let blocks = (0..)
+            .take_while(|i| weights.contains_key(&format!("fusion_blocks.{i}.ln1.weight")))
+            .count();
+        (weights, aux_layers, blocks)
+    }
+
+    fn linear(w: &HashMap<String, Vec<f32>>, prefix: &str, x: &[f64]) -> Vec<f64> {
+        let weight = &w[&format!("{prefix}.weight")];
+        let bias = &w[&format!("{prefix}.bias")];
+        let cols = x.len();
+        bias.iter()
+            .enumerate()
+            .map(|(r, &b)| {
+                let row = &weight[r * cols..(r + 1) * cols];
+                row.iter()
+                    .zip(x)
+                    .map(|(&wv, &xv)| f64::from(wv) * xv)
+                    .sum::<f64>()
+                    + f64::from(b)
+            })
+            .collect()
+    }
+
+    fn norm(w: &HashMap<String, Vec<f32>>, prefix: &str, x: &[f64]) -> Vec<f64> {
+        let gamma = &w[&format!("{prefix}.weight")];
+        let beta = &w[&format!("{prefix}.bias")];
+        let n = x.len() as f64;
+        let mean = x.iter().sum::<f64>() / n;
+        let var = x.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
+        let inv_std = 1.0 / (var + 1e-5).sqrt();
+        x.iter()
+            .enumerate()
+            .map(|(i, v)| (v - mean) * inv_std * f64::from(gamma[i]) + f64::from(beta[i]))
+            .collect()
+    }
+
+    fn silu(x: Vec<f64>) -> Vec<f64> {
+        x.into_iter().map(|v| v / (1.0 + (-v).exp())).collect()
+    }
+
+    /// f64 forward pass straight from the PyTorch-named weights: (logits, value).
+    pub(in crate::inference) fn forward(
+        w: &HashMap<String, Vec<f32>>,
+        aux_layers: usize,
+        blocks: usize,
+        board_h: &[f32],
+        piece_aux: &[f32],
+    ) -> (Vec<f64>, f64) {
+        let mut aux: Vec<f64> = piece_aux.iter().map(|&v| f64::from(v)).collect();
+        for layer in 0..aux_layers {
+            let index = 3 * layer;
+            let h = linear(w, &format!("aux_mlp.{index}"), &aux);
+            aux = silu(norm(w, &format!("aux_mlp.{}", index + 1), &h));
+        }
+        let mut concat: Vec<f64> = board_h.iter().map(|&v| f64::from(v)).collect();
+        concat.extend(aux);
+        let pre = linear(w, "fusion_fc", &concat);
+        let mut fused = silu(norm(w, "fusion_ln", &pre));
+        for block in 0..blocks {
+            let p = format!("fusion_blocks.{block}");
+            let h = silu(norm(w, &format!("{p}.ln1"), &fused));
+            let h = linear(w, &format!("{p}.fc1"), &h);
+            let h = silu(norm(w, &format!("{p}.ln2"), &h));
+            let h = linear(w, &format!("{p}.fc2"), &h);
+            fused = fused.iter().zip(&h).map(|(a, b)| a + b).collect();
+        }
+        let p = silu(linear(w, "policy_fc", &fused));
+        let logits = linear(w, "policy_head", &p);
+        let v = silu(linear(w, "value_fc", &fused));
+        let value = linear(w, "value_head", &v)[0];
+        (logits, value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::heads_onnx::proto_writer::{bytes_field, varint, varint_field};
@@ -896,71 +997,6 @@ mod tests {
         }
     }
 
-    fn reference_linear(w: &HashMap<String, Vec<f32>>, prefix: &str, x: &[f64]) -> Vec<f64> {
-        let weight = &w[&format!("{prefix}.weight")];
-        let bias = &w[&format!("{prefix}.bias")];
-        let cols = x.len();
-        bias.iter()
-            .enumerate()
-            .map(|(r, &b)| {
-                let row = &weight[r * cols..(r + 1) * cols];
-                row.iter()
-                    .zip(x)
-                    .map(|(&wv, &xv)| f64::from(wv) * xv)
-                    .sum::<f64>()
-                    + f64::from(b)
-            })
-            .collect()
-    }
-
-    fn reference_norm(w: &HashMap<String, Vec<f32>>, prefix: &str, x: &[f64]) -> Vec<f64> {
-        let gamma = &w[&format!("{prefix}.weight")];
-        let beta = &w[&format!("{prefix}.bias")];
-        let n = x.len() as f64;
-        let mean = x.iter().sum::<f64>() / n;
-        let var = x.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
-        let inv_std = 1.0 / (var + 1e-5).sqrt();
-        x.iter()
-            .enumerate()
-            .map(|(i, v)| (v - mean) * inv_std * f64::from(gamma[i]) + f64::from(beta[i]))
-            .collect()
-    }
-
-    fn reference_silu(x: Vec<f64>) -> Vec<f64> {
-        x.into_iter().map(|v| v / (1.0 + (-v).exp())).collect()
-    }
-
-    fn reference_forward(
-        w: &HashMap<String, Vec<f32>>,
-        shape: Shape,
-        board_h: &[f32],
-        piece_aux: &[f32],
-    ) -> (Vec<f64>, f64) {
-        let mut aux: Vec<f64> = piece_aux.iter().map(|&v| f64::from(v)).collect();
-        for layer in 0..shape.aux_layers {
-            let index = 3 * layer;
-            let h = reference_linear(w, &format!("aux_mlp.{index}"), &aux);
-            aux = reference_silu(reference_norm(w, &format!("aux_mlp.{}", index + 1), &h));
-        }
-        let mut concat: Vec<f64> = board_h.iter().map(|&v| f64::from(v)).collect();
-        concat.extend(aux);
-        let pre = reference_linear(w, "fusion_fc", &concat);
-        let mut fused = reference_silu(reference_norm(w, "fusion_ln", &pre));
-        for block in 0..shape.blocks {
-            let p = format!("fusion_blocks.{block}");
-            let h = reference_silu(reference_norm(w, &format!("{p}.ln1"), &fused));
-            let h = reference_linear(w, &format!("{p}.fc1"), &h);
-            let h = reference_silu(reference_norm(w, &format!("{p}.ln2"), &h));
-            let h = reference_linear(w, &format!("{p}.fc2"), &h);
-            fused = fused.iter().zip(&h).map(|(a, b)| a + b).collect();
-        }
-        let p = reference_silu(reference_linear(w, "policy_fc", &fused));
-        let logits = reference_linear(w, "policy_head", &p);
-        let v = reference_silu(reference_linear(w, "value_fc", &fused));
-        let value = reference_linear(w, "value_head", &v)[0];
-        (logits, value)
-    }
-
     fn load_graph(bytes: &[u8], board_hidden: usize, isa: Isa) -> LoadResult<HeadsModel> {
         let graph = parse_model_graph(bytes).expect("synthetic graph parses");
         HeadsModel::from_graph(graph, Path::new("synthetic.heads.onnx"), board_hidden, isa)
@@ -995,7 +1031,7 @@ mod tests {
             for seed in 0..4 {
                 let (board_h, aux) = sample_inputs(seed, shape);
                 let (expected_logits, expected_value) =
-                    reference_forward(&weights, shape, &board_h, &aux);
+                    reference::forward(&weights, shape.aux_layers, shape.blocks, &board_h, &aux);
 
                 let mut board_input = vec![0.0; model.board_fusion_width()];
                 model.board_fusion_input(&board_h, &mut scratch, &mut board_input);
