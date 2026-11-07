@@ -666,7 +666,6 @@ def train_offline_variant(
         model,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
-        adamw_foreach=True,
     )
     history: list[dict[str, float | int]] = []
     rng = np.random.default_rng(schedule_seed)

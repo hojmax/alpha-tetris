@@ -215,7 +215,7 @@ class Trainer:
         )
 
         # torch.compile is slower than eager on Apple Silicon (MPS); auto-disable
-        # there so optimizer + train loop both use the eager fast path.
+        # there so the train loop uses the eager fast path.
         self._effective_use_torch_compile = (
             config.optimizer.use_torch_compile and self.device.type != "mps"
         )
@@ -225,7 +225,6 @@ class Trainer:
             self.model,
             learning_rate=config.optimizer.learning_rate,
             weight_decay=config.optimizer.weight_decay,
-            adamw_foreach=not self._effective_use_torch_compile,
         )
 
         # Create scheduler
@@ -1838,9 +1837,14 @@ class Trainer:
         if not collect_metrics:
             return {}
 
-        # Only sync GPU and update loss balancer when collecting metrics
-        policy_loss_scalar = policy_loss.item()
-        value_loss_scalar = value_loss.item()
+        # Only sync GPU and update loss balancer when collecting metrics; fetch
+        # all scalars in one device->host transfer.
+        loss_scalars = [total_loss.detach(), policy_loss.detach(), value_loss.detach()]
+        if grad_norm is not None:
+            loss_scalars.append(grad_norm)
+        loss_values = torch.stack(loss_scalars).tolist()
+        total_loss_scalar, policy_loss_scalar, value_loss_scalar = loss_values[:3]
+        grad_norm_scalar = loss_values[3] if grad_norm is not None else float("nan")
         self.loss_balancer.append(policy_loss_scalar, value_loss_scalar)
         if self.loss_balancer.has_history():
             self._cached_value_loss_weight = (
@@ -1850,15 +1854,13 @@ class Trainer:
 
         policy_loss_avg, value_loss_avg = self.loss_balancer.averages()
         metrics = {
-            "train/loss": total_loss.item(),
+            "train/loss": total_loss_scalar,
             "train/policy_loss": policy_loss_scalar,
             "train/value_loss": value_loss_scalar,
             "train/policy_loss_avg": policy_loss_avg,
             "train/value_loss_avg": value_loss_avg,
             "train/value_loss_weight": value_loss_weight,
-            "train/grad_norm": grad_norm.item()
-            if grad_norm is not None
-            else float("nan"),
+            "train/grad_norm": grad_norm_scalar,
             "train/learning_rate": self.optimizer.param_groups[0]["lr"],
         }
         metrics.update(

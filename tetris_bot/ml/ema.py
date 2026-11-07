@@ -15,8 +15,6 @@ class ExponentialMovingAverage:
         self.decay = decay
         self._ema_model = copy.deepcopy(model).eval()
         self._ema_model.requires_grad_(False)
-        self._named_parameters = dict(self._ema_model.named_parameters())
-        self._named_buffers = dict(self._ema_model.named_buffers())
 
     @property
     def model(self) -> nn.Module:
@@ -24,10 +22,17 @@ class ExponentialMovingAverage:
 
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
-        for name, parameter in model.named_parameters():
-            self._named_parameters[name].lerp_(
-                parameter.detach(),
-                1.0 - self.decay,
+        # Parameter/buffer lists are re-read every call: `Module.to()` (used by
+        # ONNX export) replaces buffer tensors, so cached lists would go stale.
+        # `deepcopy` preserves registration order, so the lists pair up 1:1.
+        ema_parameters: list[torch.Tensor] = list(self._ema_model.parameters())
+        parameters: list[torch.Tensor] = list(model.parameters())
+        if len(parameters) != len(ema_parameters):
+            raise ValueError(
+                "EMA update model has a different parameter count "
+                f"({len(parameters)} vs {len(ema_parameters)})"
             )
-        for name, buffer in model.named_buffers():
-            self._named_buffers[name].copy_(buffer.detach())
+        torch._foreach_lerp_(ema_parameters, parameters, 1.0 - self.decay)
+        ema_buffers = list(self._ema_model.buffers())
+        if ema_buffers:
+            torch._foreach_copy_(ema_buffers, list(model.buffers()))

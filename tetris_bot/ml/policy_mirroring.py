@@ -288,8 +288,27 @@ LEGACY_TO_FLAT_INDEX_BY_PIECE, LEGACY_TO_FLAT_VALID_BY_PIECE = (
 FLAT_MIRROR_INDEX_BY_PIECE, FLAT_MIRROR_VALID_BY_PIECE = _build_flat_mirror_maps()
 
 
+MIRROR_PIECE_PERMUTATION = torch.tensor(MIRROR_PIECE_TYPE_ORDER, dtype=torch.long)
+
+# Per-device copies of the constant lookup tables above. A fresh `.to(device)`
+# per call is a blocking host->device copy, which on CUDA/MPS synchronizes the
+# stream (CPU waits for all queued GPU work) on every mirrored training step.
+_DEVICE_TABLE_CACHE: dict[tuple[int, torch.device], torch.Tensor] = {}
+
+
+def _table_on_device(table: torch.Tensor, device: torch.device) -> torch.Tensor:
+    if table.device == device:
+        return table
+    key = (id(table), device)
+    cached = _DEVICE_TABLE_CACHE.get(key)
+    if cached is None:
+        cached = table.to(device)
+        _DEVICE_TABLE_CACHE[key] = cached
+    return cached
+
+
 def _piece_permutation_tensor(device: torch.device) -> torch.Tensor:
-    return torch.tensor(MIRROR_PIECE_TYPE_ORDER, device=device, dtype=torch.long)
+    return _table_on_device(MIRROR_PIECE_PERMUTATION, device)
 
 
 def mirror_piece_indices(piece_indices: torch.Tensor) -> torch.Tensor:
@@ -374,12 +393,12 @@ def legacy_action_masks_to_flat(
             "legacy_action_masks_to_flat expects legacy-width masks: "
             f"got {action_masks.shape[1]}, expected {LEGACY_NUM_ACTIONS}"
         )
-    mapping = LEGACY_TO_FLAT_INDEX_BY_PIECE.to(action_masks.device).index_select(
-        0, current_pieces
-    )
-    source_valid = LEGACY_TO_FLAT_VALID_BY_PIECE.to(action_masks.device).index_select(
-        0, current_pieces
-    )
+    mapping = _table_on_device(
+        LEGACY_TO_FLAT_INDEX_BY_PIECE, action_masks.device
+    ).index_select(0, current_pieces)
+    source_valid = _table_on_device(
+        LEGACY_TO_FLAT_VALID_BY_PIECE, action_masks.device
+    ).index_select(0, current_pieces)
     return _scatter_bool(
         action_masks,
         mapping,
@@ -397,12 +416,12 @@ def legacy_policy_targets_to_flat(
             "legacy_policy_targets_to_flat expects legacy-width policy targets: "
             f"got {policy_targets.shape[1]}, expected {LEGACY_NUM_ACTIONS}"
         )
-    mapping = LEGACY_TO_FLAT_INDEX_BY_PIECE.to(policy_targets.device).index_select(
-        0, current_pieces
-    )
-    source_valid = LEGACY_TO_FLAT_VALID_BY_PIECE.to(policy_targets.device).index_select(
-        0, current_pieces
-    )
+    mapping = _table_on_device(
+        LEGACY_TO_FLAT_INDEX_BY_PIECE, policy_targets.device
+    ).index_select(0, current_pieces)
+    source_valid = _table_on_device(
+        LEGACY_TO_FLAT_VALID_BY_PIECE, policy_targets.device
+    ).index_select(0, current_pieces)
     return _scatter_float(
         policy_targets,
         mapping,
@@ -420,12 +439,12 @@ def mirror_flat_action_masks(
             "mirror_flat_action_masks expects flat-width masks: "
             f"got {action_masks.shape[1]}, expected {NEW_NUM_ACTIONS}"
         )
-    mapping = FLAT_MIRROR_INDEX_BY_PIECE.to(action_masks.device).index_select(
-        0, current_pieces
-    )
-    source_valid = FLAT_MIRROR_VALID_BY_PIECE.to(action_masks.device).index_select(
-        0, current_pieces
-    )
+    mapping = _table_on_device(
+        FLAT_MIRROR_INDEX_BY_PIECE, action_masks.device
+    ).index_select(0, current_pieces)
+    source_valid = _table_on_device(
+        FLAT_MIRROR_VALID_BY_PIECE, action_masks.device
+    ).index_select(0, current_pieces)
     return _scatter_bool(
         action_masks,
         mapping,
@@ -443,12 +462,12 @@ def mirror_flat_policy_targets(
             "mirror_flat_policy_targets expects flat-width policy targets: "
             f"got {policy_targets.shape[1]}, expected {NEW_NUM_ACTIONS}"
         )
-    mapping = FLAT_MIRROR_INDEX_BY_PIECE.to(policy_targets.device).index_select(
-        0, current_pieces
-    )
-    source_valid = FLAT_MIRROR_VALID_BY_PIECE.to(policy_targets.device).index_select(
-        0, current_pieces
-    )
+    mapping = _table_on_device(
+        FLAT_MIRROR_INDEX_BY_PIECE, policy_targets.device
+    ).index_select(0, current_pieces)
+    source_valid = _table_on_device(
+        FLAT_MIRROR_VALID_BY_PIECE, policy_targets.device
+    ).index_select(0, current_pieces)
     return _scatter_float(
         policy_targets,
         mapping,
