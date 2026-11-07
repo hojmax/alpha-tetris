@@ -680,3 +680,73 @@ fn test_policy_mean_only_does_not_change_masked_probabilities() {
     let shifted = masked_softmax(&shifted_logits, &mask);
     assert_eq!(baseline, shifted);
 }
+
+/// Latency probe for the heads path on real states (`TETRIS_BENCH_MODEL=<bundle>.onnx`).
+#[test]
+#[ignore]
+fn bench_heads_latency_probe() {
+    let Ok(model_path) = std::env::var("TETRIS_BENCH_MODEL") else {
+        eprintln!("TETRIS_BENCH_MODEL not set");
+        return;
+    };
+    let nn = TetrisNN::load(&model_path).expect("load");
+    let mut envs = Vec::new();
+    for seed in 0..8u64 {
+        let mut env = TetrisEnv::with_seed(10, 20, 1000 + seed);
+        for step in 0..30usize {
+            if env.game_over {
+                break;
+            }
+            envs.push(env.clone());
+            let actions = env.get_cached_valid_action_indices_arc();
+            let action = actions[(step * 7 + seed as usize) % actions.len()];
+            env.execute_action_index(action);
+        }
+    }
+    let inputs: Vec<(Vec<f32>, Vec<usize>)> = envs
+        .iter()
+        .map(|env| {
+            (
+                encode_piece_aux_features(env, 50).unwrap(),
+                env.get_cached_valid_action_indices_arc().to_vec(),
+            )
+        })
+        .collect();
+    let avg_valid: f64 = inputs.iter().map(|x| x.1.len() as f64).sum::<f64>() / inputs.len() as f64;
+    for round in 0..3 {
+        let iters = 50_000;
+        let start = std::time::Instant::now();
+        let mut acc = 0.0f32;
+        let mut logits = vec![0.0f32; 64];
+        let mut scratch = nn.heads_scratch.borrow_mut();
+        for i in 0..iters {
+            let (aux, valid) = &inputs[i % inputs.len()];
+            let value = nn
+                .run_heads_trunk(&envs[i % envs.len()], aux, &mut scratch)
+                .unwrap();
+            nn.heads
+                .policy_logits(&scratch, valid, &mut logits[..valid.len()]);
+            acc += value + logits[0];
+        }
+        drop(scratch);
+        let heads_us = start.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        let start = std::time::Instant::now();
+        for i in 0..iters {
+            let env = &envs[i % envs.len()];
+            let (policy, value) = nn
+                .predict_with_valid_actions(
+                    env,
+                    &inputs[i % inputs.len()].1,
+                    50,
+                    PredictionNoiseSettings::default(),
+                )
+                .unwrap();
+            acc += value + policy[0];
+        }
+        let predict_us = start.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        eprintln!(
+            "round {round}: states={} avg_valid={avg_valid:.1} heads_us={heads_us:.2} predict_valid_hot_us={predict_us:.2} (acc {acc})",
+            inputs.len()
+        );
+    }
+}
