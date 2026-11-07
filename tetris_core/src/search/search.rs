@@ -562,6 +562,7 @@ fn build_result_from_root(
     config: &MCTSConfig,
     root: &DecisionNode,
     rng: &mut StdRng,
+    num_simulations: u32,
 ) -> MCTSResult {
     let mut result_policy = vec![0.0; NUM_ACTIONS];
 
@@ -614,7 +615,7 @@ fn build_result_from_root(
         policy: result_policy,
         action,
         value: root_value,
-        num_simulations: config.num_simulations,
+        num_simulations,
     }
 }
 
@@ -641,16 +642,17 @@ pub(super) fn run_search<E: LeafEvaluator>(
 
     let mut traversal_stats = TraversalStats::default();
     let mut q_bounds = seed_q_bounds_from_tree(&root);
-    for _ in 0..config.num_simulations {
+    let num_new_simulations = config.new_simulations_for_root(root.visit_count);
+    for _ in 0..num_new_simulations {
         match simulate(config, evaluator, &mut root, &mut rng, &mut q_bounds) {
             SimulationOutcome::Expansion => traversal_stats.expansions += 1,
             SimulationOutcome::TerminalEnd => traversal_stats.terminal_ends += 1,
             SimulationOutcome::HorizonEnd => traversal_stats.horizon_ends += 1,
         }
     }
-    debug_assert_eq!(traversal_stats.total(), config.num_simulations);
+    debug_assert_eq!(traversal_stats.total(), num_new_simulations);
 
-    let mcts_result = build_result_from_root(config, &root, &mut rng);
+    let mcts_result = build_result_from_root(config, &root, &mut rng, num_new_simulations);
     let tree_stats = compute_tree_stats(&root);
     (mcts_result, root, tree_stats, traversal_stats, q_bounds)
 }
@@ -1028,7 +1030,7 @@ mod tests {
         config.visit_sampling_epsilon = 0.0;
 
         let mut rng = StdRng::seed_from_u64(11);
-        let result = build_result_from_root(&config, &root, &mut rng);
+        let result = build_result_from_root(&config, &root, &mut rng, config.num_simulations);
         assert_eq!(result.action, 10);
     }
 
@@ -1172,6 +1174,43 @@ mod tests {
             result.policy.iter().any(|&p| p > 0.0),
             "Policy should have non-zero entries"
         );
+    }
+
+    #[test]
+    fn test_run_search_counts_reused_visits_toward_budget() {
+        let env = TetrisEnv::new(10, 20);
+        let mut config = MCTSConfig::default();
+        config.num_simulations = 50;
+        config.count_reused_visits = true;
+        config.min_new_simulations = 5;
+
+        let evaluator = ConstantEvaluator { value: 1.0 };
+        let root_policy = uniform_action_priors_for_valid_actions(
+            env.get_cached_valid_action_indices_arc().len(),
+        );
+        let mut root = DecisionNode::new(env);
+        root.set_nn_output_for_valid_actions(&root_policy, 0.0);
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut q_bounds = (0.0_f32, 0.0_f32);
+        for _ in 0..30 {
+            simulate(&config, &evaluator, &mut root, &mut rng, &mut q_bounds);
+        }
+        assert_eq!(root.visit_count, 30);
+
+        // 30 carried visits: only the remaining 20 of the 50-visit budget are run.
+        let (result, root, _tree_stats, traversal_stats, _q_bounds) =
+            run_search(&config, &evaluator, root, false);
+        assert_eq!(traversal_stats.total(), 20);
+        assert_eq!(result.num_simulations, 20);
+        assert_eq!(root.visit_count, 50);
+
+        // Budget already exceeded: the min_new_simulations floor still applies.
+        let (result, root, _tree_stats, traversal_stats, _q_bounds) =
+            run_search(&config, &evaluator, root, false);
+        assert_eq!(traversal_stats.total(), 5);
+        assert_eq!(result.num_simulations, 5);
+        assert_eq!(root.visit_count, 55);
     }
 
     #[test]

@@ -95,6 +95,8 @@ def _build_mcts_config(self_play: SelfPlayConfig) -> MCTSConfig:
     cfg.nn_value_weight = self_play.nn_value_weight_schedule.initial
     cfg.use_parent_value_for_unvisited_q = self_play.use_parent_value_for_unvisited_q
     cfg.reuse_tree = self_play.reuse_tree
+    cfg.count_reused_visits = self_play.count_reused_visits
+    cfg.min_new_simulations = self_play.min_new_simulations
     return cfg
 
 

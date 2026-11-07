@@ -52,6 +52,18 @@ pub struct MCTSConfig {
     /// spawn is extracted and used as the starting point for the next search.
     #[pyo3(get, set)]
     pub reuse_tree: bool,
+    /// Count visits carried into a reused root toward `num_simulations`.
+    /// When true, a reused root with `v` visits runs
+    /// `max(min_new_simulations, num_simulations - v)` new simulations, so every search ends
+    /// with roughly `num_simulations` root visits. When false, each search adds
+    /// `num_simulations` new simulations on top of any carried visits. Fresh roots always run
+    /// `num_simulations`.
+    #[pyo3(get, set)]
+    pub count_reused_visits: bool,
+    /// Lower bound on new simulations per search when `count_reused_visits` is enabled
+    /// (clamped to `num_simulations`), so root noise still influences every search.
+    #[pyo3(get, set)]
+    pub min_new_simulations: u32,
     /// Mean of Gaussian noise added independently to each policy logit before masking/softmax.
     #[pyo3(get, set)]
     pub policy_noise_mean: f32,
@@ -91,12 +103,25 @@ impl MCTSConfig {
             nn_value_weight: 1.0,
             use_parent_value_for_unvisited_q: false,
             reuse_tree: true,
+            count_reused_visits: false,
+            min_new_simulations: 0,
             policy_noise_mean: 0.0,
             policy_noise_std: 0.0,
             value_noise_mean: 0.0,
             value_noise_std: 0.0,
             prediction_noise_seed: None,
         }
+    }
+}
+
+impl MCTSConfig {
+    /// Number of new simulations to run from a root that already has `root_visits` visits.
+    pub(crate) fn new_simulations_for_root(&self, root_visits: u32) -> u32 {
+        if !self.count_reused_visits {
+            return self.num_simulations;
+        }
+        let floor = self.min_new_simulations.min(self.num_simulations);
+        self.num_simulations.saturating_sub(root_visits).max(floor)
     }
 }
 
@@ -127,10 +152,35 @@ mod tests {
         assert_eq!(config.nn_value_weight, 1.0);
         assert!(!config.use_parent_value_for_unvisited_q);
         assert!(config.reuse_tree);
+        assert!(!config.count_reused_visits);
+        assert_eq!(config.min_new_simulations, 0);
         assert_eq!(config.policy_noise_mean, 0.0);
         assert_eq!(config.policy_noise_std, 0.0);
         assert_eq!(config.value_noise_mean, 0.0);
         assert_eq!(config.value_noise_std, 0.0);
         assert_eq!(config.prediction_noise_seed, None);
+    }
+
+    #[test]
+    fn test_new_simulations_for_root_ignores_carried_visits_by_default() {
+        let mut config = MCTSConfig::default();
+        config.num_simulations = 2000;
+        assert_eq!(config.new_simulations_for_root(0), 2000);
+        assert_eq!(config.new_simulations_for_root(1500), 2000);
+    }
+
+    #[test]
+    fn test_new_simulations_for_root_counts_carried_visits_with_floor() {
+        let mut config = MCTSConfig::default();
+        config.num_simulations = 2000;
+        config.count_reused_visits = true;
+        config.min_new_simulations = 250;
+        assert_eq!(config.new_simulations_for_root(0), 2000);
+        assert_eq!(config.new_simulations_for_root(600), 1400);
+        assert_eq!(config.new_simulations_for_root(1900), 250);
+        assert_eq!(config.new_simulations_for_root(5000), 250);
+
+        config.min_new_simulations = 10_000;
+        assert_eq!(config.new_simulations_for_root(5000), 2000);
     }
 }
