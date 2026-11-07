@@ -41,6 +41,8 @@ self_play:
   visit_sampling_epsilon: 0.2
   mcts_seed: 0
   reuse_tree: true
+  count_reused_visits: false
+  min_new_simulations: 0
   num_workers: 32
   max_placements: 50
   penalty_schedule:

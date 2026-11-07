@@ -1381,6 +1381,8 @@ class Trainer:
             self.config.self_play.use_parent_value_for_unvisited_q
         )
         mcts_config.reuse_tree = self.config.self_play.reuse_tree
+        mcts_config.count_reused_visits = self.config.self_play.count_reused_visits
+        mcts_config.min_new_simulations = self.config.self_play.min_new_simulations
         return mcts_config
 
     def _effective_starting_incumbent_penalties(self) -> tuple[float, float]:

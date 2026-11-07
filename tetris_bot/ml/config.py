@@ -141,6 +141,12 @@ class SelfPlayConfig(ConfigModel):
     visit_sampling_epsilon: float
     mcts_seed: int | None
     reuse_tree: bool
+    # Visit budget instead of a playout budget: visits carried into a reused root count
+    # toward num_simulations, so each search runs max(min_new_simulations,
+    # num_simulations - carried) new simulations. With tree reuse ~37% of root visits are
+    # carried over at 2000 sims, so the default (False) spends ~1.6x the nominal budget.
+    count_reused_visits: bool = False
+    min_new_simulations: int = Field(default=0, ge=0)
     num_workers: int
     max_placements: int
     penalty_schedule: PenaltyScheduleConfig = Field(
@@ -166,6 +172,8 @@ SELF_PLAY_SNAPSHOT_FIELDS: tuple[str, ...] = (
     "use_parent_value_for_unvisited_q",
     "visit_sampling_epsilon",
     "reuse_tree",
+    "count_reused_visits",
+    "min_new_simulations",
     "max_placements",
     "penalty_schedule",
     "nn_value_weight_schedule",
@@ -192,6 +200,9 @@ class SelfPlaySnapshot(ConfigModel):
     use_parent_value_for_unvisited_q: bool
     visit_sampling_epsilon: float
     reuse_tree: bool
+    # Defaults keep snapshots published by older trainers parseable.
+    count_reused_visits: bool = False
+    min_new_simulations: int = Field(default=0, ge=0)
     max_placements: int
     penalty_schedule: PenaltyScheduleConfig = Field(
         default_factory=PenaltyScheduleConfig
