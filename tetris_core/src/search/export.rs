@@ -2,7 +2,7 @@
 //!
 //! Functions for exporting the MCTS tree structure for visualization.
 
-use super::nodes::{ChanceNode, DecisionNode, MCTSNode};
+use super::nodes::{ChanceNode, DecisionNode};
 use super::results::TreeNodeExport;
 
 /// Recursively export a decision node and its subtree
@@ -37,15 +37,13 @@ pub(super) fn export_decision_node(
     nodes.push(export);
 
     // Export children (sorted by action index for deterministic order)
-    let mut child_keys: Vec<usize> = node.children.keys().copied().collect();
-    child_keys.sort();
+    let mut children: Vec<(usize, &ChanceNode)> = node.children().collect();
+    children.sort_by_key(|&(action_idx, _)| action_idx);
 
     let mut child_ids = Vec::new();
-    for action_idx in child_keys {
-        if let Some(MCTSNode::Chance(chance_node)) = node.children.get(&action_idx) {
-            let child_id = export_chance_node(chance_node, Some(id), Some(action_idx), nodes);
-            child_ids.push(child_id);
-        }
+    for (action_idx, chance_node) in children {
+        let child_id = export_chance_node(chance_node, Some(id), Some(action_idx), nodes);
+        child_ids.push(child_id);
     }
 
     // Update our children list
@@ -85,16 +83,11 @@ pub(super) fn export_chance_node(
 
     nodes.push(export);
 
-    // Export children (sorted by piece type for deterministic order)
-    let mut child_keys: Vec<usize> = node.children.keys().copied().collect();
-    child_keys.sort();
-
+    // Export children (ascending piece type / chance outcome key)
     let mut child_ids = Vec::new();
-    for piece_type in child_keys {
-        if let Some(MCTSNode::Decision(decision_node)) = node.children.get(&piece_type) {
-            let child_id = export_decision_node(decision_node, Some(id), Some(piece_type), nodes);
-            child_ids.push(child_id);
-        }
+    for (piece_type, decision_node) in node.children() {
+        let child_id = export_decision_node(decision_node, Some(id), Some(piece_type), nodes);
+        child_ids.push(child_id);
     }
 
     nodes[id].children = child_ids;
@@ -106,6 +99,7 @@ pub(super) fn export_chance_node(
 mod tests {
     use super::*;
     use crate::game::env::TetrisEnv;
+    use crate::search::nodes::ChanceOutcomes;
 
     #[test]
     fn test_export_decision_node_sorts_children_and_sets_edges() {
@@ -114,8 +108,8 @@ mod tests {
         root.visit_count = 4;
         root.value_sum = 10.0;
 
-        let chance_high = ChanceNode::new(env.clone(), 3, 0, vec![1, 2]);
-        let mut chance_low = ChanceNode::new(env.clone(), 1, 0, vec![4, 5]);
+        let chance_high = ChanceNode::new(env.clone(), 3, 0, ChanceOutcomes::from_keys(&[1, 2]));
+        let mut chance_low = ChanceNode::new(env.clone(), 1, 0, ChanceOutcomes::from_keys(&[4, 5]));
 
         // Insert out of order to verify deterministic sorting in export.
         let mut env_piece_5 = env.clone();
@@ -128,15 +122,13 @@ mod tests {
         let mut decision_piece_2 = DecisionNode::new(env_piece_2);
         decision_piece_2.visit_count = 1;
         decision_piece_2.value_sum = 1.0;
-        chance_low
-            .children
-            .insert(5, MCTSNode::Decision(decision_piece_5));
-        chance_low
-            .children
-            .insert(2, MCTSNode::Decision(decision_piece_2));
+        chance_low.set_child(5, decision_piece_5);
+        chance_low.set_child(2, decision_piece_2);
 
-        root.children.insert(10, MCTSNode::Chance(chance_high));
-        root.children.insert(1, MCTSNode::Chance(chance_low));
+        let low_action = root.valid_actions[1];
+        let high_action = root.valid_actions[10];
+        root.set_child_for_action(high_action, chance_high);
+        root.set_child_for_action(low_action, chance_low);
 
         let mut nodes = Vec::new();
         let root_id = export_decision_node(&root, None, None, &mut nodes);
@@ -145,15 +137,16 @@ mod tests {
         assert_eq!(nodes[0].node_type, "decision");
         assert_eq!(nodes[0].mean_value, 2.5);
 
-        // Root children should be sorted by action index: 1 then 10.
+        // Root children should be sorted by action index.
         let root_child_edges: Vec<usize> = nodes[0]
             .children
             .iter()
             .map(|&id| nodes[id].edge_from_parent.unwrap())
             .collect();
-        assert_eq!(root_child_edges, vec![1, 10]);
+        assert!(low_action < high_action);
+        assert_eq!(root_child_edges, vec![low_action, high_action]);
 
-        // The chance node on action 1 should sort its piece children: 2 then 5.
+        // The chance node on the lower action should sort its piece children: 2 then 5.
         let chance_node_id = nodes[0].children[0];
         let chance_child_edges: Vec<usize> = nodes[chance_node_id]
             .children

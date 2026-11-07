@@ -167,7 +167,7 @@ Memory note:
 
 - CPU RAM usually becomes the bottleneck before GPU VRAM.
 - Biggest levers: `buffer_size`, `num_workers`, `bootstrap_num_simulations`, replay mirror/staging settings.
-- Rust per-worker caches (`PLACEMENT_CACHE_MAX_ENTRIES`, `BOARD_ANALYSIS_CACHE_MAX_ENTRIES`) scale with worker count.
+- Rust per-worker caches scale with worker count: the placement cache (`PLACEMENT_CACHE_MAX_ENTRIES` = 30K entries, ~1 KB each) and the NN board-embedding cache (`BOARD_CACHE_MAX_ENTRIES` = 1M entries, ~1.1 KB each, ~1.1 GB per worker when full). Board overhang/hole analysis is computed directly (bitboard), with no global cache.
 
 Disk note:
 

@@ -10,7 +10,7 @@ use crate::game::env::TetrisEnv;
 use crate::inference::{PredictionNoiseSettings, TetrisNN};
 
 use super::config::MCTSConfig;
-use super::nodes::{ChanceNode, DecisionNode, MCTSNode};
+use super::nodes::{ChanceNode, ChanceOutcomes, DecisionNode, NodeRef, NO_CHANCE_OUTCOME};
 use super::results::{MCTSResult, TraversalStats, TreeStats};
 use crate::game::action_space::{HOLD_ACTION_INDEX, NUM_ACTIONS};
 
@@ -66,10 +66,6 @@ fn scale_nn_value(value: f32, nn_value_weight: f32) -> f32 {
     value * nn_value_weight
 }
 
-/// Sentinel chance outcome for transitions where no new visible queue piece is revealed.
-/// This occurs on hold-swap actions (holding with an already occupied hold slot).
-pub(super) const NO_CHANCE_OUTCOME: usize = NUM_PIECE_TYPES;
-
 fn action_reveals_new_visible_piece(state: &TetrisEnv, action_idx: usize) -> bool {
     if action_idx != HOLD_ACTION_INDEX {
         return true;
@@ -81,7 +77,13 @@ fn action_reveals_new_visible_piece(state: &TetrisEnv, action_idx: usize) -> boo
 }
 
 pub(super) trait LeafEvaluator {
-    fn evaluate(&self, state: &TetrisEnv, max_placements: u32) -> Result<LeafEvaluation, String>;
+    /// Evaluate a freshly expanded leaf whose valid actions are `valid_actions`.
+    fn evaluate(
+        &self,
+        state: &TetrisEnv,
+        valid_actions: &[usize],
+        max_placements: u32,
+    ) -> Result<LeafEvaluation, String>;
 }
 
 pub(super) struct LeafEvaluation {
@@ -97,11 +99,15 @@ pub(super) struct NeuralLeafEvaluator<'a> {
 }
 
 impl LeafEvaluator for NeuralLeafEvaluator<'_> {
-    fn evaluate(&self, state: &TetrisEnv, max_placements: u32) -> Result<LeafEvaluation, String> {
-        let valid_actions = state.get_cached_valid_action_indices_arc();
+    fn evaluate(
+        &self,
+        state: &TetrisEnv,
+        valid_actions: &[usize],
+        max_placements: u32,
+    ) -> Result<LeafEvaluation, String> {
         match self.nn.predict_with_valid_actions(
             state,
-            valid_actions.as_slice(),
+            valid_actions,
             max_placements as usize,
             self.prediction_noise,
         ) {
@@ -121,8 +127,12 @@ impl LeafEvaluator for NeuralLeafEvaluator<'_> {
 pub(super) struct BootstrapLeafEvaluator;
 
 impl LeafEvaluator for BootstrapLeafEvaluator {
-    fn evaluate(&self, state: &TetrisEnv, _max_placements: u32) -> Result<LeafEvaluation, String> {
-        let valid_actions = state.get_cached_valid_action_indices_arc();
+    fn evaluate(
+        &self,
+        _state: &TetrisEnv,
+        valid_actions: &[usize],
+        _max_placements: u32,
+    ) -> Result<LeafEvaluation, String> {
         Ok(LeafEvaluation {
             action_priors: uniform_action_priors_for_valid_actions(valid_actions.len()),
             raw_value: 0.0,
@@ -155,16 +165,27 @@ pub(super) fn seed_q_bounds_from_tree(root: &DecisionNode) -> (f32, f32) {
         hi = hi.max(v);
     }
 
-    let mut stack: Vec<&MCTSNode> = root.children.values().collect();
+    let mut stack: Vec<NodeRef> = root
+        .children()
+        .map(|(_, chance)| NodeRef::Chance(chance))
+        .collect();
     while let Some(node) = stack.pop() {
-        if node.visit_count() > 0 {
-            let v = node.mean_value();
-            lo = lo.min(v);
-            hi = hi.max(v);
+        let (visit_count, mean) = match node {
+            NodeRef::Decision(d) => (d.visit_count, d.mean_value()),
+            NodeRef::Chance(c) => (c.visit_count, c.mean_value()),
+        };
+        if visit_count > 0 {
+            lo = lo.min(mean);
+            hi = hi.max(mean);
         }
         match node {
-            MCTSNode::Decision(d) => stack.extend(d.children.values()),
-            MCTSNode::Chance(c) => stack.extend(c.children.values()),
+            NodeRef::Decision(d) => {
+                stack.extend(d.children().map(|(_, chance)| NodeRef::Chance(chance)))
+            }
+            NodeRef::Chance(c) => stack.extend(
+                c.children()
+                    .map(|(_, decision)| NodeRef::Decision(decision)),
+            ),
         }
     }
 
@@ -175,20 +196,25 @@ pub(super) fn seed_q_bounds_from_tree(root: &DecisionNode) -> (f32, f32) {
     }
 }
 
+/// Decision nodes visited by one simulation, each with the `valid_actions` position taken.
+type SimulationPath = Vec<(*mut DecisionNode, usize)>;
+
 /// Run a single MCTS simulation using the provided leaf evaluator.
 ///
 /// Uses raw pointers for tree traversal to track the path from root to leaf.
 /// This is a common pattern in tree structures where we need mutable access
-/// to nodes at multiple levels simultaneously.
+/// to nodes at multiple levels simultaneously. `path` is caller-provided scratch
+/// space so repeated simulations reuse one allocation.
 fn simulate<E: LeafEvaluator>(
     config: &MCTSConfig,
     evaluator: &E,
     root: &mut DecisionNode,
     rng: &mut StdRng,
     q_bounds: &mut (f32, f32),
+    path: &mut SimulationPath,
 ) -> SimulationOutcome {
     let root_cumulative_attack = root.state.attack as f32;
-    let mut path: Vec<(*mut DecisionNode, usize)> = Vec::new();
+    path.clear();
     let mut path_attack_sum: f32 = 0.0;
     let mut current = root as *mut DecisionNode;
 
@@ -200,7 +226,7 @@ fn simulate<E: LeafEvaluator>(
         if node.state.placement_count >= config.max_placements {
             let total_value = root_cumulative_attack + path_attack_sum;
             update_q_bounds(q_bounds, total_value);
-            backup_with_value(&path, total_value, config.track_value_history);
+            backup_with_value(path, total_value, config.track_value_history);
             return SimulationOutcome::HorizonEnd;
         }
 
@@ -212,7 +238,7 @@ fn simulate<E: LeafEvaluator>(
             );
             let total_value = root_cumulative_attack + path_attack_sum - penalty;
             update_q_bounds(q_bounds, total_value);
-            backup_with_value(&path, total_value, config.track_value_history);
+            backup_with_value(path, total_value, config.track_value_history);
             return SimulationOutcome::TerminalEnd;
         }
 
@@ -220,13 +246,14 @@ fn simulate<E: LeafEvaluator>(
             panic!("BUG: non-terminal DecisionNode has no valid actions");
         }
 
-        let action_idx = node.select_action(
+        let action_position = node.select_action_position(
             config.c_puct,
             *q_bounds,
             config.use_parent_value_for_unvisited_q,
         );
+        let action_idx = node.valid_actions[action_position];
         let mut expanded_action = false;
-        if !node.children.contains_key(&action_idx) {
+        if node.child(action_position).is_none() {
             let child = match expand_action(node, action_idx) {
                 Ok(child) => child,
                 Err(ExpandActionError::InvariantViolation { action_idx }) => {
@@ -245,21 +272,15 @@ fn simulate<E: LeafEvaluator>(
                     panic!("MCTS leaf evaluation failed during expansion: {}", error);
                 }
             };
-            node.children.insert(action_idx, child);
+            node.set_child(action_position, child);
             expanded_action = true;
         }
 
-        let chance_node = match node.children.get_mut(&action_idx) {
-            Some(MCTSNode::Chance(chance_node)) => chance_node,
-            Some(MCTSNode::Decision(_)) => {
-                unreachable!("BUG: Decision node child should be ChanceNode");
-            }
-            None => {
-                unreachable!("BUG: child should exist after contains_key check");
-            }
-        };
+        let chance_node = node
+            .child_mut(action_position)
+            .expect("BUG: child should exist after expansion check");
         chance_node.visit_count += 1;
-        path.push((current, action_idx));
+        path.push((current, action_position));
         path_attack_sum += chance_node.attack as f32;
         if chance_node.state.game_over {
             let penalty = super::utils::compute_death_penalty(
@@ -269,7 +290,7 @@ fn simulate<E: LeafEvaluator>(
             );
             let total_value = root_cumulative_attack + path_attack_sum - penalty;
             update_q_bounds(q_bounds, total_value);
-            backup_with_value(&path, total_value, config.track_value_history);
+            backup_with_value(path, total_value, config.track_value_history);
             return if expanded_action {
                 SimulationOutcome::Expansion
             } else {
@@ -279,7 +300,7 @@ fn simulate<E: LeafEvaluator>(
         if chance_node.state.placement_count >= config.max_placements {
             let total_value = root_cumulative_attack + path_attack_sum;
             update_q_bounds(q_bounds, total_value);
-            backup_with_value(&path, total_value, config.track_value_history);
+            backup_with_value(path, total_value, config.track_value_history);
             return if expanded_action {
                 SimulationOutcome::Expansion
             } else {
@@ -288,7 +309,7 @@ fn simulate<E: LeafEvaluator>(
         }
 
         let chance_outcome = chance_node.select_piece_random(rng);
-        if !chance_node.children.contains_key(&chance_outcome) {
+        if chance_node.child(chance_outcome).is_none() {
             let decision_child = match expand_chance(
                 evaluator,
                 chance_node,
@@ -315,20 +336,11 @@ fn simulate<E: LeafEvaluator>(
                     );
                 }
             };
-            chance_node.children.insert(chance_outcome, decision_child);
-
-            let decision_node = match chance_node.children.get_mut(&chance_outcome) {
-                Some(MCTSNode::Decision(decision_node)) => decision_node,
-                Some(MCTSNode::Chance(_)) => {
-                    unreachable!("BUG: chance expansion should create DecisionNode");
-                }
-                None => {
-                    unreachable!("BUG: just inserted chance child but it's missing");
-                }
-            };
+            let overhang_fields = chance_node.overhang_fields;
+            let decision_node = chance_node.set_child(chance_outcome, decision_child);
 
             let leaf_overhang = super::utils::compute_overhang_penalty(
-                chance_node.overhang_fields,
+                overhang_fields,
                 config.overhang_penalty_weight,
             );
             let leaf_value = if decision_node.is_terminal {
@@ -345,26 +357,24 @@ fn simulate<E: LeafEvaluator>(
             let total_value = root_cumulative_attack + path_attack_sum + leaf_value;
             decision_node.set_initial_total_value_estimate(total_value);
             update_q_bounds(q_bounds, total_value);
-            backup_with_value(&path, total_value, config.track_value_history);
+            backup_with_value(path, total_value, config.track_value_history);
             return SimulationOutcome::Expansion;
         }
 
-        match chance_node.children.get_mut(&chance_outcome) {
-            Some(MCTSNode::Decision(decision_node)) => current = decision_node as *mut DecisionNode,
-            Some(MCTSNode::Chance(_)) => {
-                unreachable!("BUG: ChanceNode child should be DecisionNode");
-            }
-            None => {
-                unreachable!("BUG: child should exist after insertion");
-            }
-        }
+        current = chance_node
+            .child_mut(chance_outcome)
+            .expect("BUG: chance child should exist after expansion check")
+            as *mut DecisionNode;
     }
 }
 
 /// Expand an action from a decision node (creates chance node)
 ///
 /// Returns an error if action execution fails.
-fn expand_action(parent: &DecisionNode, action_idx: usize) -> Result<MCTSNode, ExpandActionError> {
+fn expand_action(
+    parent: &DecisionNode,
+    action_idx: usize,
+) -> Result<ChanceNode, ExpandActionError> {
     let mut new_state = parent.state.mcts_clone();
     let attack = match new_state.execute_action_index(action_idx) {
         Some(attack) => attack,
@@ -381,22 +391,22 @@ fn expand_action(parent: &DecisionNode, action_idx: usize) -> Result<MCTSNode, E
         QUEUE_SIZE
     };
     new_state.truncate_queue(visible_queue_len);
-    let bag_remaining = if reveals_new_visible_piece {
-        let possible_pieces = new_state.get_possible_next_pieces();
-        if possible_pieces.is_empty() {
+    let outcomes = if reveals_new_visible_piece {
+        let piece_mask = new_state.possible_next_piece_mask(new_state.piece_queue.len());
+        if piece_mask == 0 {
             return Err(ExpandActionError::InvariantViolation { action_idx });
         }
-        possible_pieces
+        ChanceOutcomes::from_piece_mask(piece_mask)
     } else {
-        vec![NO_CHANCE_OUTCOME]
+        ChanceOutcomes::from_keys(&[NO_CHANCE_OUTCOME])
     };
 
-    Ok(MCTSNode::Chance(ChanceNode::new(
+    Ok(ChanceNode::new(
         new_state,
         attack,
         overhang_fields,
-        bag_remaining,
-    )))
+        outcomes,
+    ))
 }
 
 /// Expand a chance node for a specific piece (creates decision node)
@@ -409,7 +419,7 @@ fn expand_chance<E: LeafEvaluator>(
     parent: &ChanceNode,
     chance_outcome: usize,
     max_placements: u32,
-) -> Result<MCTSNode, ExpandActionError> {
+) -> Result<DecisionNode, ExpandActionError> {
     let mut new_state = parent.state.mcts_clone();
 
     if chance_outcome < NUM_PIECE_TYPES {
@@ -422,15 +432,15 @@ fn expand_chance<E: LeafEvaluator>(
 
     let mut node = DecisionNode::new(new_state);
     let evaluation = evaluator
-        .evaluate(&node.state, max_placements)
+        .evaluate(&node.state, &node.valid_actions, max_placements)
         .map_err(ExpandActionError::EvaluatorFailed)?;
     node.set_nn_output_for_valid_actions_with_raw(
-        &evaluation.action_priors,
+        evaluation.action_priors,
         evaluation.raw_value,
         evaluation.value,
     );
 
-    Ok(MCTSNode::Decision(node))
+    Ok(node)
 }
 
 /// Backpropagate total episode value through the path.
@@ -448,20 +458,14 @@ fn backup_with_value(
     }
 
     // All nodes on the path get the same total value
-    for &(node_ptr, action_idx) in path.iter() {
+    for &(node_ptr, action_position) in path.iter() {
         // SAFETY: node_ptr was stored during the simulation traversal from valid
         // &mut DecisionNode references. The tree hasn't been modified, so pointers
         // remain valid. Each pointer in the path refers to a distinct node.
         let node = unsafe { &mut *node_ptr };
 
         // Update child stats (the ChanceNode we traversed through)
-        if let Some(child) = node.children.get_mut(&action_idx) {
-            let chance_child = match child {
-                MCTSNode::Chance(chance_child) => chance_child,
-                MCTSNode::Decision(_) => {
-                    unreachable!("DecisionNode child must be a ChanceNode")
-                }
-            };
+        if let Some(chance_child) = node.child_mut(action_position) {
             chance_child.value_sum += total_value;
             if track_value_history {
                 chance_child
@@ -490,11 +494,6 @@ pub(super) fn compute_tree_stats(root: &DecisionNode) -> TreeStats {
     let mut max_attack: u32 = 0;
     let mut max_depth: u32 = 0;
 
-    enum NodeRef<'a> {
-        Decision(&'a DecisionNode),
-        Chance(&'a ChanceNode),
-    }
-
     let mut stack: Vec<(NodeRef, u32)> = vec![(NodeRef::Decision(root), 0)];
 
     while let Some((node, depth)) = stack.pop() {
@@ -503,30 +502,32 @@ pub(super) fn compute_tree_stats(root: &DecisionNode) -> TreeStats {
 
         match node {
             NodeRef::Decision(d) => {
-                if d.children.is_empty() {
+                let stack_len_before = stack.len();
+                stack.extend(
+                    d.children()
+                        .map(|(_, chance)| (NodeRef::Chance(chance), depth + 1)),
+                );
+                let num_children = (stack.len() - stack_len_before) as u32;
+                if num_children == 0 {
                     num_leaves += 1;
                 } else {
                     non_leaf_count += 1;
-                    children_sum += d.children.len() as u32;
-                    for child in d.children.values() {
-                        if let MCTSNode::Chance(cn) = child {
-                            stack.push((NodeRef::Chance(cn), depth + 1));
-                        }
-                    }
+                    children_sum += num_children;
                 }
             }
             NodeRef::Chance(c) => {
                 max_attack = max_attack.max(c.attack);
-                if c.children.is_empty() {
+                let stack_len_before = stack.len();
+                stack.extend(
+                    c.children()
+                        .map(|(_, decision)| (NodeRef::Decision(decision), depth + 1)),
+                );
+                let num_children = (stack.len() - stack_len_before) as u32;
+                if num_children == 0 {
                     num_leaves += 1;
                 } else {
                     non_leaf_count += 1;
-                    children_sum += c.children.len() as u32;
-                    for child in c.children.values() {
-                        if let MCTSNode::Decision(dn) = child {
-                            stack.push((NodeRef::Decision(dn), depth + 1));
-                        }
-                    }
+                    children_sum += num_children;
                 }
             }
         }
@@ -567,27 +568,26 @@ fn build_result_from_root(
     let mut result_policy = vec![0.0; NUM_ACTIONS];
 
     debug_assert!(
-        root.children.values().map(|c| c.visit_count()).sum::<u32>() > 0,
+        root.children().map(|(_, c)| c.visit_count).sum::<u32>() > 0,
         "MCTS should have visits after simulations"
     );
 
     let greedy_action = root
-        .children
-        .iter()
-        .max_by(|(&idx_a, child_a), (&idx_b, child_b)| {
+        .children()
+        .max_by(|(idx_a, child_a), (idx_b, child_b)| {
             child_a
-                .visit_count()
-                .cmp(&child_b.visit_count())
-                .then_with(|| idx_b.cmp(&idx_a))
+                .visit_count
+                .cmp(&child_b.visit_count)
+                .then_with(|| idx_b.cmp(idx_a))
         })
-        .map(|(&idx, _)| idx)
+        .map(|(idx, _)| idx)
         .expect("MCTS root should have children after simulations");
 
     if config.temperature == 0.0 {
         result_policy[greedy_action] = 1.0;
     } else {
-        for (&action_idx, child) in &root.children {
-            result_policy[action_idx] = (child.visit_count() as f32).powf(1.0 / config.temperature);
+        for (action_idx, child) in root.children() {
+            result_policy[action_idx] = (child.visit_count as f32).powf(1.0 / config.temperature);
         }
         let sum: f32 = result_policy.iter().sum();
         if sum > 0.0 {
@@ -643,8 +643,16 @@ pub(super) fn run_search<E: LeafEvaluator>(
     let mut traversal_stats = TraversalStats::default();
     let mut q_bounds = seed_q_bounds_from_tree(&root);
     let num_new_simulations = config.new_simulations_for_root(root.visit_count);
+    let mut path = SimulationPath::new();
     for _ in 0..num_new_simulations {
-        match simulate(config, evaluator, &mut root, &mut rng, &mut q_bounds) {
+        match simulate(
+            config,
+            evaluator,
+            &mut root,
+            &mut rng,
+            &mut q_bounds,
+            &mut path,
+        ) {
             SimulationOutcome::Expansion => traversal_stats.expansions += 1,
             SimulationOutcome::TerminalEnd => traversal_stats.terminal_ends += 1,
             SimulationOutcome::HorizonEnd => traversal_stats.horizon_ends += 1,
@@ -705,7 +713,7 @@ pub(crate) fn search_internal_without_nn(
     TraversalStats,
     (f32, f32),
 ) {
-    let root_policy = env.get_cached_uniform_policy().as_ref().clone();
+    let root_policy = env.uniform_policy();
     let mut root = DecisionNode::new(env.clone());
     root.set_nn_output(&root_policy, 0.0);
     root.set_initial_total_value_estimate(root.state.attack as f32 + root.nn_value);
@@ -728,17 +736,10 @@ pub(super) fn extract_subtree(
     action_idx: usize,
     chance_outcome: usize,
 ) -> Option<DecisionNode> {
-    // Take the ChanceNode child for the chosen action
-    let mut chance_node = match root.children.remove(&action_idx)? {
-        MCTSNode::Chance(cn) => cn,
-        MCTSNode::Decision(_) => return None,
-    };
-
-    // Take the DecisionNode child for the realized chance outcome.
-    match chance_node.children.remove(&chance_outcome)? {
-        MCTSNode::Decision(dn) => Some(dn),
-        MCTSNode::Chance(_) => None,
-    }
+    // Take the ChanceNode child for the chosen action, then the DecisionNode child
+    // for the realized chance outcome.
+    root.take_child_for_action(action_idx)?
+        .take_child(chance_outcome)
 }
 
 #[cfg(test)]
@@ -750,6 +751,23 @@ mod tests {
 
     use super::*;
 
+    fn simulate_once<E: LeafEvaluator>(
+        config: &MCTSConfig,
+        evaluator: &E,
+        root: &mut DecisionNode,
+        rng: &mut StdRng,
+        q_bounds: &mut (f32, f32),
+    ) -> SimulationOutcome {
+        simulate(
+            config,
+            evaluator,
+            root,
+            rng,
+            q_bounds,
+            &mut SimulationPath::new(),
+        )
+    }
+
     struct ConstantEvaluator {
         value: f32,
     }
@@ -757,10 +775,10 @@ mod tests {
     impl LeafEvaluator for ConstantEvaluator {
         fn evaluate(
             &self,
-            state: &TetrisEnv,
+            _state: &TetrisEnv,
+            valid_actions: &[usize],
             _max_placements: u32,
         ) -> Result<LeafEvaluation, String> {
-            let valid_actions = state.get_cached_valid_action_indices_arc();
             Ok(LeafEvaluation {
                 action_priors: uniform_action_priors_for_valid_actions(valid_actions.len()),
                 raw_value: self.value,
@@ -787,9 +805,9 @@ mod tests {
         let env_a = base_env.clone();
         let mut env_b = base_env;
         let hidden_idx = QUEUE_SIZE;
-        let hidden_piece = env_a.piece_queue[hidden_idx];
+        let hidden_piece = env_a.piece_queue.get(hidden_idx).unwrap();
         let alt_hidden_piece = (hidden_piece + 1) % NUM_PIECE_TYPES;
-        env_b.piece_queue[hidden_idx] = alt_hidden_piece;
+        env_b.piece_queue.set(hidden_idx, alt_hidden_piece);
 
         let root_a = DecisionNode::new(env_a);
         let root_b = DecisionNode::new(env_b);
@@ -804,18 +822,10 @@ mod tests {
             "Placement action should remain valid after hidden-piece mutation"
         );
 
-        let chance_a = match expand_action(&root_a, placement_action)
-            .expect("expand_action should succeed for placement")
-        {
-            MCTSNode::Chance(node) => node,
-            MCTSNode::Decision(_) => unreachable!("expand_action should return ChanceNode"),
-        };
-        let chance_b = match expand_action(&root_b, placement_action)
-            .expect("expand_action should succeed for placement")
-        {
-            MCTSNode::Chance(node) => node,
-            MCTSNode::Decision(_) => unreachable!("expand_action should return ChanceNode"),
-        };
+        let chance_a = expand_action(&root_a, placement_action)
+            .expect("expand_action should succeed for placement");
+        let chance_b = expand_action(&root_b, placement_action)
+            .expect("expand_action should succeed for placement");
 
         assert_eq!(chance_a.state.get_queue_len(), QUEUE_SIZE - 1);
         assert_eq!(chance_b.state.get_queue_len(), QUEUE_SIZE - 1);
@@ -825,7 +835,7 @@ mod tests {
             "Post-action observable queue should not depend on hidden piece #6"
         );
         assert_eq!(
-            chance_a.bag_remaining, chance_b.bag_remaining,
+            chance_a.outcomes, chance_b.outcomes,
             "Chance outcomes should not depend on hidden piece #6"
         );
     }
@@ -848,12 +858,8 @@ mod tests {
             "Hold should be valid when hold slot is occupied and hold is unused"
         );
 
-        let chance = match expand_action(&root, HOLD_ACTION_INDEX)
-            .expect("expand_action should succeed for hold-swap")
-        {
-            MCTSNode::Chance(node) => node,
-            MCTSNode::Decision(_) => unreachable!("expand_action should return ChanceNode"),
-        };
+        let chance = expand_action(&root, HOLD_ACTION_INDEX)
+            .expect("expand_action should succeed for hold-swap");
 
         assert_eq!(
             chance.state.get_queue_len(),
@@ -865,7 +871,7 @@ mod tests {
             env.get_queue(QUEUE_SIZE),
             "Hold-swap should not advance the queue"
         );
-        assert_eq!(chance.bag_remaining, vec![NO_CHANCE_OUTCOME]);
+        assert_eq!(chance.outcomes.as_slice(), &[NO_CHANCE_OUTCOME as u8]);
     }
 
     #[test]
@@ -888,7 +894,7 @@ mod tests {
 
         let evaluator = ConstantEvaluator { value: 123.0 };
         let mut rng = StdRng::seed_from_u64(1234);
-        let outcome = simulate(
+        let outcome = simulate_once(
             &config,
             &evaluator,
             &mut root,
@@ -926,7 +932,7 @@ mod tests {
 
         let evaluator = ConstantEvaluator { value: 42.0 };
         let mut rng = StdRng::seed_from_u64(7);
-        let outcome = simulate(
+        let outcome = simulate_once(
             &config,
             &evaluator,
             &mut root,
@@ -936,7 +942,7 @@ mod tests {
         assert_eq!(outcome, SimulationOutcome::HorizonEnd);
 
         assert_eq!(root.value_sum, 0.0);
-        assert!(root.children.is_empty());
+        assert!(!root.has_children());
     }
 
     #[test]
@@ -954,7 +960,7 @@ mod tests {
 
         let evaluator = ConstantEvaluator { value: 0.0 };
         let mut rng = StdRng::seed_from_u64(123);
-        simulate(
+        simulate_once(
             &config,
             &evaluator,
             &mut root,
@@ -985,7 +991,7 @@ mod tests {
 
         let evaluator = ConstantEvaluator { value: 123.0 };
         let mut rng = StdRng::seed_from_u64(99);
-        let outcome = simulate(
+        let outcome = simulate_once(
             &config,
             &evaluator,
             &mut root,
@@ -994,10 +1000,12 @@ mod tests {
         );
         assert_eq!(outcome, SimulationOutcome::Expansion);
 
-        let chance_node = match root.children.get(&placement_action) {
-            Some(MCTSNode::Chance(chance_node)) => chance_node,
-            _ => panic!("Expected expanded child to be a ChanceNode"),
-        };
+        let placement_position = root
+            .action_position(placement_action)
+            .expect("placement action should be valid");
+        let chance_node = root
+            .child(placement_position)
+            .expect("Expected expanded child to be a ChanceNode");
         let expected_value = chance_node.attack as f32;
         assert!(
             (root.value_sum - expected_value).abs() < 1e-6,
@@ -1014,16 +1022,18 @@ mod tests {
         let root_policy = vec![1.0 / NUM_ACTIONS as f32; NUM_ACTIONS];
         root.set_nn_output(&root_policy, 0.0);
 
+        let left_action = root.valid_actions[1];
+        let right_action = root.valid_actions[3];
         let mut left_env = env.clone();
         left_env.placement_count = 1;
-        let mut left_child = ChanceNode::new(left_env, 0, 0, Vec::new());
+        let mut left_child = ChanceNode::new(left_env, 0, 0, ChanceOutcomes::default());
         left_child.visit_count = 5;
         let mut right_env = env;
         right_env.placement_count = 1;
-        let mut right_child = ChanceNode::new(right_env, 0, 0, Vec::new());
+        let mut right_child = ChanceNode::new(right_env, 0, 0, ChanceOutcomes::default());
         right_child.visit_count = 5;
-        root.children.insert(10, MCTSNode::Chance(left_child));
-        root.children.insert(20, MCTSNode::Chance(right_child));
+        root.set_child_for_action(right_action, right_child);
+        root.set_child_for_action(left_action, left_child);
 
         let mut config = MCTSConfig::default();
         config.temperature = 0.0;
@@ -1031,7 +1041,8 @@ mod tests {
 
         let mut rng = StdRng::seed_from_u64(11);
         let result = build_result_from_root(&config, &root, &mut rng, config.num_simulations);
-        assert_eq!(result.action, 10);
+        assert!(left_action < right_action);
+        assert_eq!(result.action, left_action);
     }
 
     #[test]
@@ -1044,41 +1055,28 @@ mod tests {
         let evaluator = ConstantEvaluator { value: 1.0 };
 
         // Build a tree with a fresh search
-        let root_policy = uniform_action_priors_for_valid_actions(
-            env.get_cached_valid_action_indices_arc().len(),
-        );
+        let root_policy =
+            uniform_action_priors_for_valid_actions(env.get_cached_valid_action_indices().len());
         let mut root = DecisionNode::new(env.clone());
         root.set_nn_output_for_valid_actions(&root_policy, 0.0);
         let mut rng = StdRng::seed_from_u64(42);
         let mut q_bounds = (0.0_f32, 0.0_f32);
         for _ in 0..config.num_simulations {
-            simulate(&config, &evaluator, &mut root, &mut rng, &mut q_bounds);
+            simulate_once(&config, &evaluator, &mut root, &mut rng, &mut q_bounds);
         }
 
         // Find the best action (most visits)
-        let best_action = root
-            .children
-            .iter()
-            .max_by_key(|(_, child)| child.visit_count())
-            .map(|(&idx, _)| idx)
+        let (best_action, chance_node) = root
+            .children()
+            .max_by_key(|(_, child)| child.visit_count)
             .expect("Root should have children");
 
-        // Get the chance node for the best action and find an explored piece
-        let chance_node = match root.children.get(&best_action).unwrap() {
-            MCTSNode::Chance(cn) => cn,
-            _ => panic!("Expected ChanceNode"),
-        };
-        let explored_piece = chance_node
-            .children
-            .keys()
+        // Find an explored piece under the chance node for the best action
+        let (explored_piece, explored_child) = chance_node
+            .children()
             .next()
-            .copied()
             .expect("ChanceNode should have at least one child");
-
-        let old_visit_count = match chance_node.children.get(&explored_piece).unwrap() {
-            MCTSNode::Decision(dn) => dn.visit_count,
-            _ => panic!("Expected DecisionNode"),
-        };
+        let old_visit_count = explored_child.visit_count;
 
         // Extract the subtree
         let subtree = extract_subtree(root, best_action, explored_piece);
@@ -1105,32 +1103,24 @@ mod tests {
         config.num_simulations = 5; // Very few sims to leave some pieces unexplored
 
         let evaluator = ConstantEvaluator { value: 1.0 };
-        let root_policy = uniform_action_priors_for_valid_actions(
-            env.get_cached_valid_action_indices_arc().len(),
-        );
+        let root_policy =
+            uniform_action_priors_for_valid_actions(env.get_cached_valid_action_indices().len());
         let mut root = DecisionNode::new(env.clone());
         root.set_nn_output_for_valid_actions(&root_policy, 0.0);
         let mut rng = StdRng::seed_from_u64(42);
         let mut q_bounds = (0.0_f32, 0.0_f32);
         for _ in 0..config.num_simulations {
-            simulate(&config, &evaluator, &mut root, &mut rng, &mut q_bounds);
+            simulate_once(&config, &evaluator, &mut root, &mut rng, &mut q_bounds);
         }
 
         // Find an action that was explored
-        let action = root
-            .children
-            .keys()
+        let (action, chance_node) = root
+            .children()
             .next()
-            .copied()
             .expect("Should have at least one child");
 
-        let chance_node = match root.children.get(&action).unwrap() {
-            MCTSNode::Chance(cn) => cn,
-            _ => panic!("Expected ChanceNode"),
-        };
-
         // Find a piece that was NOT explored in this chance node
-        let unexplored_piece = (0..7).find(|p| !chance_node.children.contains_key(p));
+        let unexplored_piece = (0..7).find(|&p| chance_node.child(p).is_none());
         if let Some(piece) = unexplored_piece {
             let result = extract_subtree(root, action, piece);
             assert!(result.is_none(), "Should return None for unexplored piece");
@@ -1145,9 +1135,8 @@ mod tests {
         config.num_simulations = 50;
 
         let evaluator = ConstantEvaluator { value: 1.0 };
-        let root_policy = uniform_action_priors_for_valid_actions(
-            env.get_cached_valid_action_indices_arc().len(),
-        );
+        let root_policy =
+            uniform_action_priors_for_valid_actions(env.get_cached_valid_action_indices().len());
         let mut root = DecisionNode::new(env.clone());
         root.set_nn_output_for_valid_actions(&root_policy, 0.0);
 
@@ -1155,7 +1144,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
         let mut q_bounds = (0.0_f32, 0.0_f32);
         for _ in 0..config.num_simulations {
-            simulate(&config, &evaluator, &mut root, &mut rng, &mut q_bounds);
+            simulate_once(&config, &evaluator, &mut root, &mut rng, &mut q_bounds);
         }
         let visits_after_first = root.visit_count;
 
@@ -1185,16 +1174,15 @@ mod tests {
         config.min_new_simulations = 5;
 
         let evaluator = ConstantEvaluator { value: 1.0 };
-        let root_policy = uniform_action_priors_for_valid_actions(
-            env.get_cached_valid_action_indices_arc().len(),
-        );
+        let root_policy =
+            uniform_action_priors_for_valid_actions(env.get_cached_valid_action_indices().len());
         let mut root = DecisionNode::new(env);
         root.set_nn_output_for_valid_actions(&root_policy, 0.0);
 
         let mut rng = StdRng::seed_from_u64(42);
         let mut q_bounds = (0.0_f32, 0.0_f32);
         for _ in 0..30 {
-            simulate(&config, &evaluator, &mut root, &mut rng, &mut q_bounds);
+            simulate_once(&config, &evaluator, &mut root, &mut rng, &mut q_bounds);
         }
         assert_eq!(root.visit_count, 30);
 
@@ -1234,8 +1222,8 @@ mod tests {
         let evaluator = ConstantEvaluator { value: 0.0 };
         let mut rng = StdRng::seed_from_u64(1234);
         let mut q_bounds = (0.0_f32, 0.0_f32);
-        let first = simulate(&config, &evaluator, &mut root, &mut rng, &mut q_bounds);
-        let second = simulate(&config, &evaluator, &mut root, &mut rng, &mut q_bounds);
+        let first = simulate_once(&config, &evaluator, &mut root, &mut rng, &mut q_bounds);
+        let second = simulate_once(&config, &evaluator, &mut root, &mut rng, &mut q_bounds);
 
         assert_eq!(first, SimulationOutcome::Expansion);
         assert_eq!(second, SimulationOutcome::TerminalEnd);
@@ -1260,9 +1248,8 @@ mod tests {
         config.max_placements = 8;
 
         let evaluator = ConstantEvaluator { value: 3.5 };
-        let policy = uniform_action_priors_for_valid_actions(
-            env.get_cached_valid_action_indices_arc().len(),
-        );
+        let policy =
+            uniform_action_priors_for_valid_actions(env.get_cached_valid_action_indices().len());
         let mut root = DecisionNode::new(env);
         root.set_nn_output_for_valid_actions(&policy, evaluator.value);
 
@@ -1271,7 +1258,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(7);
         let mut online_bounds = (0.0_f32, 0.0_f32);
         for _ in 0..config.num_simulations {
-            simulate(&config, &evaluator, &mut root, &mut rng, &mut online_bounds);
+            simulate_once(&config, &evaluator, &mut root, &mut rng, &mut online_bounds);
         }
 
         let seeded = seed_q_bounds_from_tree(&root);
@@ -1304,8 +1291,8 @@ mod tests {
             root_mean,
             seeded
         );
-        for child in root.children.values() {
-            if child.visit_count() > 0 {
+        for (_, child) in root.children() {
+            if child.visit_count > 0 {
                 let m = child.mean_value();
                 assert!(
                     m >= seeded.0 - 1e-5 && m <= seeded.1 + 1e-5,
@@ -1329,9 +1316,8 @@ mod tests {
         config.overhang_penalty_weight = 1.0;
 
         let evaluator = ConstantEvaluator { value: 2.0 };
-        let policy = uniform_action_priors_for_valid_actions(
-            env.get_cached_valid_action_indices_arc().len(),
-        );
+        let policy =
+            uniform_action_priors_for_valid_actions(env.get_cached_valid_action_indices().len());
         let mut root = DecisionNode::new(env);
         root.set_nn_output_for_valid_actions(&policy, evaluator.value);
 
@@ -1371,9 +1357,8 @@ mod tests {
         config.max_placements = 6;
 
         let evaluator = ConstantEvaluator { value: 0.0 };
-        let root_policy = uniform_action_priors_for_valid_actions(
-            env.get_cached_valid_action_indices_arc().len(),
-        );
+        let root_policy =
+            uniform_action_priors_for_valid_actions(env.get_cached_valid_action_indices().len());
         let mut root = DecisionNode::new(env.clone());
         root.set_nn_output_for_valid_actions(&root_policy, 0.0);
 

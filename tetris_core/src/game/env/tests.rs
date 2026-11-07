@@ -187,7 +187,7 @@ mod tests {
     fn test_7bag_randomizer() {
         let env = TetrisEnv::new(10, 20);
         assert!(env.piece_queue.len() >= 6);
-        for &pt in &env.piece_queue {
+        for pt in env.piece_queue.iter() {
             assert!(pt < 7);
         }
     }
