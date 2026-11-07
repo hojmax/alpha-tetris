@@ -2,16 +2,19 @@ from collections import deque
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 import tetris_core.tetris_core as tetris_core
 from tetris_bot.constants import (
     BOARD_HEIGHT,
     BOARD_WIDTH,
+    DEFAULT_CONFIG_PATH,
     NUM_ACTIONS,
     NUM_PIECE_TYPES,
     QUEUE_SIZE,
 )
+from tetris_bot.ml.config import load_training_config
 from tetris_bot.ml.network import (
     AUX_FEATURES,
     COMBO_NORMALIZATION_MAX,
@@ -364,17 +367,37 @@ def test_split_model_matches_end_to_end_pytorch(tmp_path: Path) -> None:
             )
 
 
-def test_split_onnx_rust_matches_end_to_end_pytorch(tmp_path: Path) -> None:
-    """Verify Rust split ONNX inference matches PyTorch end-to-end on real game states."""
+_SMALL_NETWORK_KWARGS = {
+    "trunk_channels": 16,
+    "num_conv_residual_blocks": 1,
+    "reduction_channels": 32,
+    "fc_hidden": 128,
+    "conv_kernel_size": 3,
+    "conv_padding": 1,
+}
+
+
+@pytest.mark.parametrize(
+    "network_kwargs",
+    [
+        pytest.param(_SMALL_NETWORK_KWARGS, id="small"),
+        pytest.param(
+            load_training_config(DEFAULT_CONFIG_PATH).network.model_dump(),
+            id="default_config",
+        ),
+    ],
+)
+def test_split_onnx_rust_matches_end_to_end_pytorch(
+    tmp_path: Path, network_kwargs: dict
+) -> None:
+    """Verify Rust split inference matches PyTorch end-to-end on real game states."""
     torch.manual_seed(99)
-    model = TetrisNet(
-        trunk_channels=16,
-        num_conv_residual_blocks=1,
-        reduction_channels=32,
-        fc_hidden=128,
-        conv_kernel_size=3,
-        conv_padding=1,
-    )
+    model = TetrisNet(**network_kwargs)
+    with torch.no_grad():
+        # Non-trivial GroupNorm/LayerNorm affines so the native kernels see real scales.
+        for name, param in model.named_parameters():
+            if "bn" in name or "ln" in name:
+                param.add_(0.2 * torch.randn_like(param))
     model.eval()
 
     onnx_path = tmp_path / "split_parity.onnx"
