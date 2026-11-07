@@ -7,9 +7,6 @@ use crate::game::constants::{
     HOLES_NORMALIZATION_DIVISOR, MAX_BOARD_CELLS, MAX_COLUMN_HEIGHT_NORMALIZATION_DIVISOR,
     OVERHANG_NORMALIZATION_DIVISOR, ROW_FILL_FEATURE_ROWS, TOTAL_BLOCKS_NORMALIZATION_DIVISOR,
 };
-use crate::game::env::global_cache::{
-    build_board_key, get_cached_board_analysis, insert_cached_board_analysis,
-};
 use crate::game::env::TetrisEnv;
 
 /// Sample from Dirichlet distribution.
@@ -68,22 +65,11 @@ pub fn count_overhang_fields_and_holes(env: &TetrisEnv) -> (u32, u32) {
         return cached;
     }
 
-    let board_key = build_board_key(env);
-    if let Some(key) = board_key {
-        if let Some(cached) = get_cached_board_analysis(key) {
-            env.set_cached_overhang_fields_and_holes(cached);
-            return cached;
-        }
-    }
-
     let (overhang_fields, holes) =
         analyze_overhangs_and_holes(env.board_cells(), env.width, env.height);
 
     let result = (overhang_fields, holes);
     env.set_cached_overhang_fields_and_holes(result);
-    if let Some(key) = board_key {
-        insert_cached_board_analysis(key, result);
-    }
     result
 }
 

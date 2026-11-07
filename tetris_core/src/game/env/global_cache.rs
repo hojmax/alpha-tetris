@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 
-use crate::game::constants::{BOARD_ANALYSIS_CACHE_MAX_ENTRIES, PLACEMENT_CACHE_MAX_ENTRIES};
+use crate::game::constants::PLACEMENT_CACHE_MAX_ENTRIES;
 use crate::game::piece::Piece;
 
 use std::sync::Arc;
@@ -30,8 +30,6 @@ pub(crate) struct PlacementLookupKey {
 struct WorkerGlobalCache {
     placement_cache: HashMap<PlacementLookupKey, Arc<PlacementSet>>,
     placement_order: VecDeque<PlacementLookupKey>,
-    board_analysis_cache: HashMap<PackedBoardKey, (u32, u32)>,
-    board_analysis_order: VecDeque<PackedBoardKey>,
 }
 
 thread_local! {
@@ -100,26 +98,6 @@ pub(crate) fn insert_cached_placements(key: PlacementLookupKey, value: Arc<Place
                 break;
             };
             cache.placement_cache.remove(&oldest_key);
-        }
-    });
-}
-
-pub(crate) fn get_cached_board_analysis(key: PackedBoardKey) -> Option<(u32, u32)> {
-    WORKER_GLOBAL_CACHE.with(|cache| cache.borrow().board_analysis_cache.get(&key).copied())
-}
-
-pub(crate) fn insert_cached_board_analysis(key: PackedBoardKey, value: (u32, u32)) {
-    WORKER_GLOBAL_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if cache.board_analysis_cache.insert(key, value).is_none() {
-            cache.board_analysis_order.push_back(key);
-        }
-
-        while cache.board_analysis_cache.len() > BOARD_ANALYSIS_CACHE_MAX_ENTRIES {
-            let Some(oldest_key) = cache.board_analysis_order.pop_front() else {
-                break;
-            };
-            cache.board_analysis_cache.remove(&oldest_key);
         }
     });
 }
