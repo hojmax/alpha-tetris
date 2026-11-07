@@ -4,7 +4,7 @@ use rand_distr::{Distribution, Gamma};
 
 use crate::game::constants::{
     BUMPINESS_NORMALIZATION_DIVISOR, COLUMN_HEIGHT_NORMALIZATION_DIVISOR,
-    HOLES_NORMALIZATION_DIVISOR, MAX_COLUMN_HEIGHT_NORMALIZATION_DIVISOR,
+    HOLES_NORMALIZATION_DIVISOR, MAX_BOARD_CELLS, MAX_COLUMN_HEIGHT_NORMALIZATION_DIVISOR,
     OVERHANG_NORMALIZATION_DIVISOR, ROW_FILL_FEATURE_ROWS, TOTAL_BLOCKS_NORMALIZATION_DIVISOR,
 };
 use crate::game::env::global_cache::{
@@ -76,86 +76,8 @@ pub fn count_overhang_fields_and_holes(env: &TetrisEnv) -> (u32, u32) {
         }
     }
 
-    let board = env.board_cells();
-    let width = env.width;
-    let height = env.height;
-    let cell_count = width * height;
-
-    let mut reachable = vec![false; cell_count];
-    let mut queue = vec![0usize; cell_count];
-    let mut queue_head = 0usize;
-    let mut queue_tail = 0usize;
-
-    // Multi-source flood-fill from all top-row empty cells.
-    for x in 0..width {
-        let idx = x;
-        if board[idx] != 0 || reachable[idx] {
-            continue;
-        }
-        reachable[idx] = true;
-        queue[queue_tail] = idx;
-        queue_tail += 1;
-    }
-
-    while queue_head < queue_tail {
-        let idx = queue[queue_head];
-        queue_head += 1;
-        let x = idx % width;
-        let y = idx / width;
-
-        if y > 0 {
-            let up = idx - width;
-            if board[up] == 0 && !reachable[up] {
-                reachable[up] = true;
-                queue[queue_tail] = up;
-                queue_tail += 1;
-            }
-        }
-        if y + 1 < height {
-            let down = idx + width;
-            if board[down] == 0 && !reachable[down] {
-                reachable[down] = true;
-                queue[queue_tail] = down;
-                queue_tail += 1;
-            }
-        }
-        if x > 0 {
-            let left = idx - 1;
-            if board[left] == 0 && !reachable[left] {
-                reachable[left] = true;
-                queue[queue_tail] = left;
-                queue_tail += 1;
-            }
-        }
-        if x + 1 < width {
-            let right = idx + 1;
-            if board[right] == 0 && !reachable[right] {
-                reachable[right] = true;
-                queue[queue_tail] = right;
-                queue_tail += 1;
-            }
-        }
-    }
-
-    let mut overhang_fields: u32 = 0;
-    let mut holes: u32 = 0;
-    for x in 0..env.width {
-        let mut seen_filled = false;
-        for y in 0..env.height {
-            let idx = y * env.width + x;
-            let cell = board[idx];
-            if cell != 0 {
-                seen_filled = true;
-                continue;
-            }
-            if seen_filled {
-                overhang_fields += 1;
-                if !reachable[idx] {
-                    holes += 1;
-                }
-            }
-        }
-    }
+    let (overhang_fields, holes) =
+        analyze_overhangs_and_holes(env.board_cells(), env.width, env.height);
 
     let result = (overhang_fields, holes);
     env.set_cached_overhang_fields_and_holes(result);
@@ -163,6 +85,79 @@ pub fn count_overhang_fields_and_holes(env: &TetrisEnv) -> (u32, u32) {
         insert_cached_board_analysis(key, result);
     }
     result
+}
+
+/// Bit-parallel overhang/hole analysis over per-row empty-cell masks.
+///
+/// Overhang fields are empty cells below the first filled cell of their column; holes are
+/// the overhang fields outside the 4-connected empty region seeded by the top row.
+fn analyze_overhangs_and_holes(cells: &[u8], width: usize, height: usize) -> (u32, u32) {
+    assert!(
+        width <= u32::BITS as usize && height <= MAX_BOARD_CELLS,
+        "board analysis supports up to {} columns and {} rows, got {}x{}",
+        u32::BITS,
+        MAX_BOARD_CELLS,
+        width,
+        height
+    );
+    let full_row = u32::MAX >> (u32::BITS as usize - width.max(1));
+
+    // empty[y]: bit x set iff cell (x, y) is empty; row 0 is the top row.
+    let mut empty = [0u32; MAX_BOARD_CELLS];
+    for (row_mask, row) in empty.iter_mut().zip(cells.chunks_exact(width.max(1))) {
+        *row_mask = row
+            .iter()
+            .enumerate()
+            .filter(|(_, &cell)| cell == 0)
+            .fold(0u32, |mask, (x, _)| mask | (1 << x));
+    }
+    let empty = &empty[..height];
+
+    // Flood-fill the air reachable from the top row, alternating downward and upward
+    // sweeps (each row is filled horizontally to a fixpoint) until nothing changes.
+    let mut reach = [0u32; MAX_BOARD_CELLS];
+    let reach = &mut reach[..height];
+    if height > 0 {
+        reach[0] = empty[0];
+    }
+    let fill_row = |reach: &mut [u32], y: usize| -> bool {
+        let above = if y > 0 { reach[y - 1] } else { 0 };
+        let below = if y + 1 < height { reach[y + 1] } else { 0 };
+        let mut row = (reach[y] | above | below) & empty[y];
+        loop {
+            let spread = (row | (row << 1) | (row >> 1)) & empty[y];
+            if spread == row {
+                break;
+            }
+            row = spread;
+        }
+        let changed = row != reach[y];
+        reach[y] = row;
+        changed
+    };
+    loop {
+        let mut changed = false;
+        for y in 0..height {
+            changed |= fill_row(reach, y);
+        }
+        for y in (0..height).rev() {
+            changed |= fill_row(reach, y);
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut overhang_fields = 0u32;
+    let mut holes = 0u32;
+    let mut covered = 0u32;
+    for (&empty_row, &reach_row) in empty.iter().zip(reach.iter()) {
+        let overhang_row = empty_row & covered;
+        overhang_fields += overhang_row.count_ones();
+        holes += (overhang_row & !reach_row).count_ones();
+        covered |= !empty_row & full_row;
+    }
+    (overhang_fields, holes)
 }
 
 /// Count overhang fields (empty cells with at least one filled cell above in the same column).
@@ -240,6 +235,75 @@ pub fn normalize_holes(holes: u32) -> f32 {
 mod tests {
     use super::*;
     use rand::thread_rng;
+
+    /// Straightforward queue flood fill, kept as the oracle for the bit-parallel version.
+    fn reference_overhangs_and_holes(cells: &[u8], width: usize, height: usize) -> (u32, u32) {
+        let mut reachable = vec![false; width * height];
+        let mut queue: Vec<usize> = (0..width).filter(|&x| cells[x] == 0).collect();
+        for &idx in &queue {
+            reachable[idx] = true;
+        }
+        let mut head = 0;
+        while head < queue.len() {
+            let idx = queue[head];
+            head += 1;
+            let (x, y) = (idx % width, idx / width);
+            let mut neighbors = Vec::with_capacity(4);
+            if y > 0 {
+                neighbors.push(idx - width);
+            }
+            if y + 1 < height {
+                neighbors.push(idx + width);
+            }
+            if x > 0 {
+                neighbors.push(idx - 1);
+            }
+            if x + 1 < width {
+                neighbors.push(idx + 1);
+            }
+            for next in neighbors {
+                if cells[next] == 0 && !reachable[next] {
+                    reachable[next] = true;
+                    queue.push(next);
+                }
+            }
+        }
+        let (mut overhang_fields, mut holes) = (0, 0);
+        for x in 0..width {
+            let mut seen_filled = false;
+            for y in 0..height {
+                let idx = y * width + x;
+                if cells[idx] != 0 {
+                    seen_filled = true;
+                } else if seen_filled {
+                    overhang_fields += 1;
+                    if !reachable[idx] {
+                        holes += 1;
+                    }
+                }
+            }
+        }
+        (overhang_fields, holes)
+    }
+
+    #[test]
+    fn test_analyze_overhangs_and_holes_matches_flood_fill_reference() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x0BAD_5EED);
+        for (width, height) in [(10, 20), (3, 4), (7, 9), (1, 12), (10, 1)] {
+            for _ in 0..4000 {
+                let fill_probability = rng.gen_range(0.05..0.95);
+                let cells: Vec<u8> = (0..width * height)
+                    .map(|_| u8::from(rng.gen_bool(fill_probability)))
+                    .collect();
+                assert_eq!(
+                    analyze_overhangs_and_holes(&cells, width, height),
+                    reference_overhangs_and_holes(&cells, width, height),
+                    "{width}x{height} board {cells:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_dirichlet() {
