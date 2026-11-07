@@ -207,10 +207,10 @@ impl MCTSAgent {
             return Err(PyValueError::new_err("No model loaded"));
         };
 
-        let valid_actions = env.get_cached_valid_action_indices_arc();
+        let valid_actions = env.get_cached_valid_action_indices();
         nn.predict_with_valid_actions(
             env,
-            valid_actions.as_slice(),
+            &valid_actions,
             max_placements,
             prediction_noise_from_config(&self.config),
         )

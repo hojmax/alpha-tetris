@@ -77,7 +77,13 @@ fn action_reveals_new_visible_piece(state: &TetrisEnv, action_idx: usize) -> boo
 }
 
 pub(super) trait LeafEvaluator {
-    fn evaluate(&self, state: &TetrisEnv, max_placements: u32) -> Result<LeafEvaluation, String>;
+    /// Evaluate a freshly expanded leaf whose valid actions are `valid_actions`.
+    fn evaluate(
+        &self,
+        state: &TetrisEnv,
+        valid_actions: &[usize],
+        max_placements: u32,
+    ) -> Result<LeafEvaluation, String>;
 }
 
 pub(super) struct LeafEvaluation {
@@ -93,11 +99,15 @@ pub(super) struct NeuralLeafEvaluator<'a> {
 }
 
 impl LeafEvaluator for NeuralLeafEvaluator<'_> {
-    fn evaluate(&self, state: &TetrisEnv, max_placements: u32) -> Result<LeafEvaluation, String> {
-        let valid_actions = state.get_cached_valid_action_indices_arc();
+    fn evaluate(
+        &self,
+        state: &TetrisEnv,
+        valid_actions: &[usize],
+        max_placements: u32,
+    ) -> Result<LeafEvaluation, String> {
         match self.nn.predict_with_valid_actions(
             state,
-            valid_actions.as_slice(),
+            valid_actions,
             max_placements as usize,
             self.prediction_noise,
         ) {
@@ -117,8 +127,12 @@ impl LeafEvaluator for NeuralLeafEvaluator<'_> {
 pub(super) struct BootstrapLeafEvaluator;
 
 impl LeafEvaluator for BootstrapLeafEvaluator {
-    fn evaluate(&self, state: &TetrisEnv, _max_placements: u32) -> Result<LeafEvaluation, String> {
-        let valid_actions = state.get_cached_valid_action_indices_arc();
+    fn evaluate(
+        &self,
+        _state: &TetrisEnv,
+        valid_actions: &[usize],
+        _max_placements: u32,
+    ) -> Result<LeafEvaluation, String> {
         Ok(LeafEvaluation {
             action_priors: uniform_action_priors_for_valid_actions(valid_actions.len()),
             raw_value: 0.0,
@@ -418,7 +432,7 @@ fn expand_chance<E: LeafEvaluator>(
 
     let mut node = DecisionNode::new(new_state);
     let evaluation = evaluator
-        .evaluate(&node.state, max_placements)
+        .evaluate(&node.state, &node.valid_actions, max_placements)
         .map_err(ExpandActionError::EvaluatorFailed)?;
     node.set_nn_output_for_valid_actions_with_raw(
         evaluation.action_priors,
@@ -697,7 +711,7 @@ pub(crate) fn search_internal_without_nn(
     TraversalStats,
     (f32, f32),
 ) {
-    let root_policy = env.get_cached_uniform_policy().as_ref().clone();
+    let root_policy = env.uniform_policy();
     let mut root = DecisionNode::new(env.clone());
     root.set_nn_output(&root_policy, 0.0);
     root.set_initial_total_value_estimate(root.state.attack as f32 + root.nn_value);
@@ -759,10 +773,10 @@ mod tests {
     impl LeafEvaluator for ConstantEvaluator {
         fn evaluate(
             &self,
-            state: &TetrisEnv,
+            _state: &TetrisEnv,
+            valid_actions: &[usize],
             _max_placements: u32,
         ) -> Result<LeafEvaluation, String> {
-            let valid_actions = state.get_cached_valid_action_indices_arc();
             Ok(LeafEvaluation {
                 action_priors: uniform_action_priors_for_valid_actions(valid_actions.len()),
                 raw_value: self.value,
@@ -1039,9 +1053,8 @@ mod tests {
         let evaluator = ConstantEvaluator { value: 1.0 };
 
         // Build a tree with a fresh search
-        let root_policy = uniform_action_priors_for_valid_actions(
-            env.get_cached_valid_action_indices_arc().len(),
-        );
+        let root_policy =
+            uniform_action_priors_for_valid_actions(env.get_cached_valid_action_indices().len());
         let mut root = DecisionNode::new(env.clone());
         root.set_nn_output_for_valid_actions(&root_policy, 0.0);
         let mut rng = StdRng::seed_from_u64(42);
@@ -1088,9 +1101,8 @@ mod tests {
         config.num_simulations = 5; // Very few sims to leave some pieces unexplored
 
         let evaluator = ConstantEvaluator { value: 1.0 };
-        let root_policy = uniform_action_priors_for_valid_actions(
-            env.get_cached_valid_action_indices_arc().len(),
-        );
+        let root_policy =
+            uniform_action_priors_for_valid_actions(env.get_cached_valid_action_indices().len());
         let mut root = DecisionNode::new(env.clone());
         root.set_nn_output_for_valid_actions(&root_policy, 0.0);
         let mut rng = StdRng::seed_from_u64(42);
@@ -1121,9 +1133,8 @@ mod tests {
         config.num_simulations = 50;
 
         let evaluator = ConstantEvaluator { value: 1.0 };
-        let root_policy = uniform_action_priors_for_valid_actions(
-            env.get_cached_valid_action_indices_arc().len(),
-        );
+        let root_policy =
+            uniform_action_priors_for_valid_actions(env.get_cached_valid_action_indices().len());
         let mut root = DecisionNode::new(env.clone());
         root.set_nn_output_for_valid_actions(&root_policy, 0.0);
 
@@ -1199,9 +1210,8 @@ mod tests {
         config.max_placements = 8;
 
         let evaluator = ConstantEvaluator { value: 3.5 };
-        let policy = uniform_action_priors_for_valid_actions(
-            env.get_cached_valid_action_indices_arc().len(),
-        );
+        let policy =
+            uniform_action_priors_for_valid_actions(env.get_cached_valid_action_indices().len());
         let mut root = DecisionNode::new(env);
         root.set_nn_output_for_valid_actions(&policy, evaluator.value);
 
@@ -1268,9 +1278,8 @@ mod tests {
         config.overhang_penalty_weight = 1.0;
 
         let evaluator = ConstantEvaluator { value: 2.0 };
-        let policy = uniform_action_priors_for_valid_actions(
-            env.get_cached_valid_action_indices_arc().len(),
-        );
+        let policy =
+            uniform_action_priors_for_valid_actions(env.get_cached_valid_action_indices().len());
         let mut root = DecisionNode::new(env);
         root.set_nn_output_for_valid_actions(&policy, evaluator.value);
 
@@ -1310,9 +1319,8 @@ mod tests {
         config.max_placements = 6;
 
         let evaluator = ConstantEvaluator { value: 0.0 };
-        let root_policy = uniform_action_priors_for_valid_actions(
-            env.get_cached_valid_action_indices_arc().len(),
-        );
+        let root_policy =
+            uniform_action_priors_for_valid_actions(env.get_cached_valid_action_indices().len());
         let mut root = DecisionNode::new(env.clone());
         root.set_nn_output_for_valid_actions(&root_policy, 0.0);
 

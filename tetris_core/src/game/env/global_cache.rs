@@ -4,7 +4,9 @@ use std::collections::{HashMap, VecDeque};
 use crate::game::constants::{BOARD_ANALYSIS_CACHE_MAX_ENTRIES, PLACEMENT_CACHE_MAX_ENTRIES};
 use crate::game::piece::Piece;
 
-use super::state::PlacementCache;
+use std::sync::Arc;
+
+use super::state::PlacementSet;
 use super::TetrisEnv;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -26,7 +28,7 @@ pub(crate) struct PlacementLookupKey {
 
 #[derive(Default)]
 struct WorkerGlobalCache {
-    placement_cache: HashMap<PlacementLookupKey, PlacementCache>,
+    placement_cache: HashMap<PlacementLookupKey, Arc<PlacementSet>>,
     placement_order: VecDeque<PlacementLookupKey>,
     board_analysis_cache: HashMap<PackedBoardKey, (u32, u32)>,
     board_analysis_order: VecDeque<PackedBoardKey>,
@@ -82,11 +84,11 @@ pub(crate) fn build_placement_lookup_key(
     })
 }
 
-pub(crate) fn get_cached_placements(key: PlacementLookupKey) -> Option<PlacementCache> {
+pub(crate) fn get_cached_placements(key: PlacementLookupKey) -> Option<Arc<PlacementSet>> {
     WORKER_GLOBAL_CACHE.with(|cache| cache.borrow().placement_cache.get(&key).cloned())
 }
 
-pub(crate) fn insert_cached_placements(key: PlacementLookupKey, value: PlacementCache) {
+pub(crate) fn insert_cached_placements(key: PlacementLookupKey, value: Arc<PlacementSet>) {
     WORKER_GLOBAL_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if cache.placement_cache.insert(key, value).is_none() {

@@ -1498,5 +1498,5 @@ pub fn softmax_over_valid_actions(logits: &[f32], valid_actions: &[usize]) -> Ve
 
 /// Get action mask from environment
 pub fn get_action_mask(env: &TetrisEnv) -> Vec<bool> {
-    env.get_cached_action_mask().as_ref().clone()
+    env.action_mask()
 }

@@ -9,7 +9,7 @@ use std::collections::{HashSet, VecDeque};
 
 use crate::game::action_space::get_action_space;
 use crate::game::constants::{I_PIECE, O_PIECE, S_PIECE, Z_PIECE};
-use crate::game::kicks::{get_i_kicks, get_jlstz_kicks};
+use crate::game::kicks::{get_i_kicks, get_jlstz_kicks, get_kicks_for_piece};
 use crate::game::piece::{get_cells, Piece, TETROMINO_CELLS};
 
 /// Actions that can be taken during piece movement
@@ -46,6 +46,15 @@ const X_STRIDE: usize = Y_STATES * ROT_STATES;
 const Y_STRIDE: usize = ROT_STATES;
 const NUM_STATE_INDICES: usize = X_STATES * Y_STATES * ROT_STATES; // 1,664
 const VISITED_WORDS: usize = NUM_STATE_INDICES.div_ceil(64); // 26
+/// Largest board the BFS state space covers (x up to 12, y up to 22).
+const MAX_STATE_BOARD_WIDTH: usize = (X_MIN + X_STATES as i32) as usize;
+const MAX_STATE_BOARD_HEIGHT: usize = (Y_MIN + Y_STATES as i32) as usize;
+const ALL_Y_STATES: u32 = (1 << Y_STATES) - 1;
+/// Sentinel for "no BFS state" in compact u16 state-index arrays.
+const NO_STATE: u16 = u16::MAX;
+const _: () = assert!(NUM_STATE_INDICES < NO_STATE as usize);
+/// Widest board whose column occupancy masks are kept inline in `Board`.
+const MAX_MASKED_COLUMNS: usize = 16;
 
 /// A possible placement for a piece, including the move sequence to reach it
 #[pyclass]
@@ -75,15 +84,15 @@ pub struct Placement {
     pub action_index: usize,
 }
 
-/// Compact placement metadata used by MCTS action execution/cache paths.
+/// Compact placement metadata used by MCTS action execution/cache paths (8 bytes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlacementParams {
-    pub x: i32,
-    pub y: i32,
-    pub rotation: usize,
-    pub last_kick_index: usize,
+    pub x: i8,
+    pub y: i8,
+    pub rotation: u8,
+    pub last_kick_index: u8,
     pub last_move_was_rotation: bool,
-    pub action_index: usize,
+    pub action_index: u16,
 }
 
 /// Board representation for collision checking (borrows cells to avoid cloning)
@@ -92,15 +101,16 @@ pub struct Board<'a> {
     width_u32: u32,
     height_u32: u32,
     cells: &'a [u8],
-    column_masks: Option<Vec<u32>>,
+    /// Per-column occupancy bitmasks (bit `y` set = cell occupied), when the board fits.
+    column_masks: Option<[u32; MAX_MASKED_COLUMNS]>,
 }
 
 impl<'a> Board<'a> {
     pub fn new(width: usize, height: usize, cells: &'a [u8]) -> Self {
         debug_assert!(width <= u32::MAX as usize);
         debug_assert!(height <= u32::MAX as usize);
-        let column_masks = if height <= u32::BITS as usize {
-            let mut masks = vec![0u32; width];
+        let column_masks = if height <= u32::BITS as usize && width <= MAX_MASKED_COLUMNS {
+            let mut masks = [0u32; MAX_MASKED_COLUMNS];
             for y in 0..height {
                 let row = &cells[y * width..(y + 1) * width];
                 let row_bit = 1u32 << (y as u32);
@@ -551,114 +561,193 @@ pub fn find_all_placements(
     placements
 }
 
+/// Valid positions of one piece type on one board as bitmasks over y: bit `y - Y_MIN` of
+/// `valid[rotation][x - X_MIN]` is set iff the piece fits at `(x, y)` (every cell inside the
+/// board and empty). One mask build replaces per-cell collision checks during the BFS.
+struct PieceFitMasks {
+    valid: [[u32; X_STATES]; ROT_STATES],
+}
+
+impl PieceFitMasks {
+    fn new(board: &Board<'_>, piece_type: usize) -> Self {
+        let column_masks = board
+            .column_masks
+            .as_ref()
+            .expect("BFS boards always have inline column masks");
+        let height_mask = (1u32 << board.height_u32) - 1;
+        let mut free_rows = [0u32; MAX_MASKED_COLUMNS];
+        for (free, &occupied) in free_rows.iter_mut().zip(column_masks).take(board.width) {
+            *free = !occupied & height_mask;
+        }
+
+        let mut valid = [[0u32; X_STATES]; ROT_STATES];
+        for (rotation, row) in valid.iter_mut().enumerate() {
+            let offsets = &TETROMINO_CELLS[piece_type][rotation];
+            for (x_offset, fit_mask) in row.iter_mut().enumerate() {
+                let x = X_MIN + x_offset as i32;
+                let mut mask = ALL_Y_STATES;
+                for &(dx, dy) in offsets {
+                    let column = x + dx as i32;
+                    if column < 0 || column >= board.width as i32 {
+                        mask = 0;
+                        break;
+                    }
+                    // Bit j of this cell's mask is board row `j + Y_MIN + dy`.
+                    let shift = -(Y_MIN + dy as i32);
+                    debug_assert!((0..32).contains(&shift));
+                    mask &= free_rows[column as usize] << shift;
+                }
+                *fit_mask = mask;
+            }
+        }
+        PieceFitMasks { valid }
+    }
+
+    #[inline(always)]
+    fn fits(&self, rotation: usize, x: i32, y: i32) -> bool {
+        let x_offset = (x - X_MIN) as u32;
+        let y_offset = (y - Y_MIN) as u32;
+        x_offset < X_STATES as u32
+            && y_offset < Y_STATES as u32
+            && (self.valid[rotation][x_offset as usize] >> y_offset) & 1 != 0
+    }
+
+    /// Final y after hard-dropping a piece that fits at `(x, y)`.
+    #[inline(always)]
+    fn drop_y(&self, rotation: usize, x: i32, y: i32) -> i32 {
+        let fits_from_y = self.valid[rotation][(x - X_MIN) as usize] >> (y - Y_MIN);
+        debug_assert!(fits_from_y & 1 != 0, "drop_y called on a blocked position");
+        y + fits_from_y.trailing_ones() as i32 - 1
+    }
+}
+
 /// Find all possible placements needed by MCTS.
 ///
 /// This variant skips move-sequence reconstruction and returns only placement
-/// parameters used by action execution and valid-action masking.
+/// parameters used by action execution and valid-action masking, sorted by
+/// ascending action index. It runs the same BFS (same state order, same
+/// shortest-path and tie-break rules) as `find_all_placements`, with collision
+/// checks answered from precomputed `PieceFitMasks`.
 pub fn find_all_placement_params(
     board: &Board<'_>,
     piece_type: usize,
     spawn_x: i32,
     spawn_y: i32,
 ) -> Vec<PlacementParams> {
+    assert!(
+        board.width <= MAX_STATE_BOARD_WIDTH && board.height_u32 as usize <= MAX_STATE_BOARD_HEIGHT,
+        "placement BFS supports boards up to {}x{}, got {}x{}",
+        MAX_STATE_BOARD_WIDTH,
+        MAX_STATE_BOARD_HEIGHT,
+        board.width,
+        board.height_u32
+    );
+    let fit = PieceFitMasks::new(board, piece_type);
+
     let start_state = PieceState {
         x: spawn_x,
         y: spawn_y,
         rotation: 0,
     };
 
-    if !board.is_valid_position(piece_type, &start_state) {
+    if !fit.fits(0, spawn_x, spawn_y) {
         return Vec::new();
     }
 
+    // kicks[from_rotation][0 = clockwise, 1 = counter-clockwise]
+    let kicks: [[[(i32, i32); 5]; 2]; ROT_STATES] = std::array::from_fn(|from| {
+        [
+            get_kicks_for_piece(piece_type, from, (from + 1) % 4),
+            get_kicks_for_piece(piece_type, from, (from + 3) % 4),
+        ]
+    });
+
     let mut visited = [0u64; VISITED_WORDS];
-    let mut queue: Vec<(PieceState, usize)> = Vec::with_capacity(128);
+    let mut queue: Vec<(PieceState, usize)> = Vec::with_capacity(256);
     let mut queue_head = 0usize;
     let mut depth = [u16::MAX; NUM_STATE_INDICES];
     let mut last_kick_index = [0u8; NUM_STATE_INDICES];
     let mut last_move_was_rotation = [false; NUM_STATE_INDICES];
-    let mut final_best_source = [None; NUM_STATE_INDICES];
+    let mut final_best_source = [NO_STATE; NUM_STATE_INDICES];
     let mut final_best_depth = [u16::MAX; NUM_STATE_INDICES];
-    let mut final_candidate_indices = Vec::with_capacity(128);
+    let mut final_candidate_indices: Vec<usize> = Vec::with_capacity(128);
 
     let start_idx = state_to_index(&start_state);
     visited[start_idx / 64] |= 1u64 << (start_idx % 64);
     depth[start_idx] = 0;
     queue.push((start_state, start_idx));
 
-    let transitions = [
-        (-1, 0, None),
-        (1, 0, None),
-        (0, 1, None),
-        (0, 0, Some(true)),
-        (0, 0, Some(false)),
-    ];
-
     while queue_head < queue.len() {
         let (state, state_idx) = queue[queue_head];
         queue_head += 1;
 
-        let final_y = board.get_drop_y(piece_type, &state);
+        let final_y = fit.drop_y(state.rotation, state.x, state.y);
         let final_idx = ((state.x - X_MIN) as usize) * X_STRIDE
             + ((final_y - Y_MIN) as usize) * Y_STRIDE
             + state.rotation;
-        if final_best_source[final_idx].is_none() {
+        let existing_source = final_best_source[final_idx];
+        if existing_source == NO_STATE {
             final_candidate_indices.push(final_idx);
         }
         if depth[state_idx] < final_best_depth[final_idx] {
             final_best_depth[final_idx] = depth[state_idx];
-            final_best_source[final_idx] = Some(state_idx);
-        } else if depth[state_idx] == final_best_depth[final_idx] {
-            if let Some(existing_source_idx) = final_best_source[final_idx] {
-                if prefer_tspin_safe_path(
-                    last_move_was_rotation[state_idx],
-                    last_move_was_rotation[existing_source_idx],
-                ) {
-                    final_best_source[final_idx] = Some(state_idx);
-                }
-            }
+            final_best_source[final_idx] = state_idx as u16;
+        } else if depth[state_idx] == final_best_depth[final_idx]
+            && existing_source != NO_STATE
+            && prefer_tspin_safe_path(
+                last_move_was_rotation[state_idx],
+                last_move_was_rotation[existing_source as usize],
+            )
+        {
+            final_best_source[final_idx] = state_idx as u16;
         }
 
-        for &(dx, dy, rotate) in &transitions {
-            let (new_state, kick_index, is_rotation) = if let Some(clockwise) = rotate {
-                match try_rotate(board, piece_type, &state, clockwise) {
-                    Some((state, kick)) => (Some(state), kick as u8, true),
-                    None => (None, 0, false),
-                }
-            } else {
-                let candidate = PieceState {
-                    x: state.x + dx,
-                    y: state.y + dy,
-                    rotation: state.rotation,
-                };
-                if board.is_valid_position(piece_type, &candidate) {
-                    (Some(candidate), 0, false)
-                } else {
-                    (None, 0, false)
-                }
-            };
-
-            let Some(new_state) = new_state else {
-                continue;
-            };
-
-            let idx = if is_rotation {
-                state_to_index(&new_state)
-            } else {
-                match (dx, dy) {
-                    (-1, 0) => {
-                        debug_assert!(state_idx >= X_STRIDE);
-                        state_idx - X_STRIDE
+        let candidate_depth = depth[state_idx] + 1;
+        // Same transition order as `find_all_placements`: left, right, down, CW, CCW.
+        for transition in 0..5 {
+            let (new_state, idx, kick_index, is_rotation) = match transition {
+                0 | 1 | 2 => {
+                    let (dx, dy, idx) = match transition {
+                        0 => (-1, 0, state_idx.wrapping_sub(X_STRIDE)),
+                        1 => (1, 0, state_idx + X_STRIDE),
+                        _ => (0, 1, state_idx + Y_STRIDE),
+                    };
+                    let candidate = PieceState {
+                        x: state.x + dx,
+                        y: state.y + dy,
+                        rotation: state.rotation,
+                    };
+                    if !fit.fits(candidate.rotation, candidate.x, candidate.y) {
+                        continue;
                     }
-                    (1, 0) => state_idx + X_STRIDE,
-                    (0, 1) => state_idx + Y_STRIDE,
-                    _ => state_to_index(&new_state),
+                    (candidate, idx, 0u8, false)
+                }
+                _ => {
+                    let (to_rotation, rotation_kicks) = if transition == 3 {
+                        ((state.rotation + 1) % 4, &kicks[state.rotation][0])
+                    } else {
+                        ((state.rotation + 3) % 4, &kicks[state.rotation][1])
+                    };
+                    let Some((kick_index, &(dx, dy))) = rotation_kicks
+                        .iter()
+                        .enumerate()
+                        .find(|&(_, &(dx, dy))| fit.fits(to_rotation, state.x + dx, state.y + dy))
+                    else {
+                        continue;
+                    };
+                    let candidate = PieceState {
+                        x: state.x + dx,
+                        y: state.y + dy,
+                        rotation: to_rotation,
+                    };
+                    let idx = state_to_index(&candidate);
+                    (candidate, idx, kick_index as u8, true)
                 }
             };
+
             let word = idx / 64;
             let bit = idx % 64;
             let is_visited = (visited[word] & (1u64 << bit)) != 0;
-            let candidate_depth = depth[state_idx] + 1;
             let candidate_last_kick_index = if is_rotation {
                 kick_index
             } else {
@@ -685,14 +774,15 @@ pub fn find_all_placement_params(
     let dedup_by_cells = matches!(piece_type, I_PIECE | O_PIECE | S_PIECE | Z_PIECE);
     let mut seen_cells = [0u64; crate::search::NUM_PLACEMENT_ACTIONS];
     let mut seen_cells_len = 0usize;
-    let mut placements_by_action: [Option<PlacementParams>;
-        crate::game::action_space::NUM_ACTIONS] = [None; crate::game::action_space::NUM_ACTIONS];
+    let mut placements: Vec<PlacementParams> = Vec::with_capacity(final_candidate_indices.len());
     let action_space = get_action_space();
 
     for &final_idx in &final_candidate_indices {
-        let Some(source_idx) = final_best_source[final_idx] else {
+        let source_idx = final_best_source[final_idx];
+        if source_idx == NO_STATE {
             continue;
-        };
+        }
+        let source_idx = source_idx as usize;
 
         let final_state = index_to_state(final_idx);
         let x = final_state.x;
@@ -736,25 +826,23 @@ pub fn find_all_placement_params(
             );
             continue;
         };
-        debug_assert!(
-            placements_by_action[action_index].is_none(),
-            "Duplicate action index {} in placement params",
-            action_index
-        );
-        placements_by_action[action_index] = Some(PlacementParams {
-            x,
-            y,
-            rotation,
-            last_kick_index: last_kick_index[source_idx] as usize,
+        placements.push(PlacementParams {
+            x: x as i8,
+            y: y as i8,
+            rotation: rotation as u8,
+            last_kick_index: last_kick_index[source_idx],
             last_move_was_rotation: last_move_was_rotation[source_idx],
-            action_index,
+            action_index: action_index as u16,
         });
     }
 
-    let mut placements = Vec::with_capacity(seen_cells_len);
-    for placement in placements_by_action.into_iter().flatten() {
-        placements.push(placement);
-    }
+    placements.sort_unstable_by_key(|placement| placement.action_index);
+    debug_assert!(
+        placements
+            .windows(2)
+            .all(|pair| pair[0].action_index < pair[1].action_index),
+        "Duplicate action index in placement params"
+    );
     placements
 }
 
@@ -821,17 +909,88 @@ mod tests {
 
             for param in params {
                 let full_match = full_by_action
-                    .get(&param.action_index)
+                    .get(&(param.action_index as usize))
                     .copied()
                     .expect("Fast params produced an unknown action index");
-                assert_eq!(param.x, full_match.piece.x);
-                assert_eq!(param.y, full_match.piece.y);
-                assert_eq!(param.rotation, full_match.piece.rotation);
-                assert_eq!(param.last_kick_index, full_match.last_kick_index);
+                assert_eq!(param.x as i32, full_match.piece.x);
+                assert_eq!(param.y as i32, full_match.piece.y);
+                assert_eq!(param.rotation as usize, full_match.piece.rotation);
+                assert_eq!(param.last_kick_index as usize, full_match.last_kick_index);
                 assert_eq!(
                     param.last_move_was_rotation,
                     full_match.last_move_was_rotation
                 );
+            }
+        }
+    }
+
+    /// Boards with ragged stacks, overhangs and sealed holes, from a fixed-seed generator.
+    fn random_boards(count: usize, seed: u64) -> Vec<Vec<u8>> {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        (0..count)
+            .map(|_| {
+                let mut cells = empty_cells(10, 20);
+                let max_height = rng.gen_range(0..=17);
+                for x in 0..10 {
+                    let height = rng.gen_range(0..=max_height);
+                    for y in (20 - height)..20 {
+                        if rng.gen_bool(0.85) {
+                            cells[y * 10 + x] = 1;
+                        }
+                    }
+                }
+                // Floating blocks create overhangs / tuck spots reachable only by sliding.
+                for _ in 0..rng.gen_range(0..6) {
+                    let x = rng.gen_range(0..10);
+                    let y = rng.gen_range(3..20);
+                    cells[y * 10 + x] = 1;
+                }
+                cells
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_find_placement_params_matches_full_placements_on_random_boards() {
+        for cells in random_boards(1500, 0xC0FFEE) {
+            let board = Board::new(10, 20, &cells);
+            for piece_type in 0..7 {
+                for (spawn_x, spawn_y) in [(3, 0), (3, -1), (4, 2), (0, 1)] {
+                    let full = find_all_placements(&board, piece_type, spawn_x, spawn_y);
+                    let params = find_all_placement_params(&board, piece_type, spawn_x, spawn_y);
+                    let mut full_by_action: Vec<(usize, i32, i32, usize, usize, bool)> = full
+                        .iter()
+                        .map(|p| {
+                            (
+                                p.action_index,
+                                p.piece.x,
+                                p.piece.y,
+                                p.piece.rotation,
+                                p.last_kick_index,
+                                p.last_move_was_rotation,
+                            )
+                        })
+                        .collect();
+                    full_by_action.sort_unstable();
+                    let fast: Vec<(usize, i32, i32, usize, usize, bool)> = params
+                        .iter()
+                        .map(|p| {
+                            (
+                                p.action_index as usize,
+                                p.x as i32,
+                                p.y as i32,
+                                p.rotation as usize,
+                                p.last_kick_index as usize,
+                                p.last_move_was_rotation,
+                            )
+                        })
+                        .collect();
+                    assert_eq!(
+                        fast, full_by_action,
+                        "piece {piece_type} from ({spawn_x}, {spawn_y}) on board {cells:?}"
+                    );
+                }
             }
         }
     }

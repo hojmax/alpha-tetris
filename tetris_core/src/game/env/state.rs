@@ -15,13 +15,23 @@ use crate::game::constants::{
 use crate::game::moves::PlacementParams;
 use crate::game::scoring::AttackResult;
 
-#[derive(Clone)]
-pub(crate) struct PlacementCache {
-    pub placements: Arc<Vec<PlacementParams>>,
-    pub action_to_placement_idx: Arc<Vec<Option<usize>>>,
-    pub valid_action_indices: Arc<Vec<usize>>,
-    pub action_mask: Arc<Vec<bool>>,
-    pub uniform_policy: Arc<Vec<f32>>,
+/// Placements reachable by the current piece plus hold availability. Shared (behind one
+/// `Arc`) by env clones and the per-worker placement cache.
+pub(crate) struct PlacementSet {
+    /// Reachable placements in ascending action-index order.
+    pub placements: Vec<PlacementParams>,
+    /// Valid action indices: the placement actions (ascending), then hold if available.
+    pub valid_action_indices: Vec<usize>,
+}
+
+impl PlacementSet {
+    pub(crate) fn placement_for_action(&self, action_idx: usize) -> Option<&PlacementParams> {
+        let index = self
+            .placements
+            .binary_search_by_key(&action_idx, |placement| placement.action_index as usize)
+            .ok()?;
+        Some(&self.placements[index])
+    }
 }
 
 #[pyclass]
@@ -70,7 +80,7 @@ pub struct TetrisEnv {
     pub(crate) column_heights: [u8; BOARD_WIDTH],
     /// Cached placements for current piece (invalidated when piece or board changes)
     /// Using RefCell for interior mutability to cache with &self
-    pub(crate) placements_cache: RefCell<Option<PlacementCache>>,
+    pub(crate) placements_cache: RefCell<Option<Arc<PlacementSet>>>,
     /// Cached board diagnostics (overhang_fields, holes), invalidated only when board changes.
     pub(crate) board_analysis_cache: RefCell<Option<(u32, u32)>>,
 }
