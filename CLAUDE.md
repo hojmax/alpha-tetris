@@ -93,7 +93,7 @@ make compare-warm-start-trunk-sizes
 tetris_core/src/
 ├── game/       # deterministic Tetris rules and environment
 ├── search/     # MCTS implementation
-├── inference/  # ONNX inference backends
+├── inference/  # native conv trunk + board MLP, ONNX heads backends
 ├── runtime/    # self-play and evaluator runtime
 ├── replay/     # replay and NPZ persistence
 └── lib.rs      # PyO3 module exports
@@ -184,7 +184,8 @@ Disk note:
 
 1. Edit `tetris_bot/ml/network.py`.
 2. Update Rust inference encoding in `tetris_core/src/inference/mod.rs` if feature schema changes.
-3. Retrain/export ONNX artifacts.
+3. The board-embedding path (conv trunk + `fc.bin` MLP) runs natively in Rust: `tetris_core/src/inference/conv.rs` reads weights from `X.conv.onnx` and strictly pattern-matches the exported `ConvBackbone` graph, so any change to `ConvBackbone`/`ResidualConvBlock`/GroupNorm/SiLU structure must be mirrored there (loading fails loudly otherwise). Only the heads model still goes through tract/ORT.
+4. Retrain/export ONNX artifacts.
 
 ### Train / Resume
 
@@ -228,6 +229,8 @@ cd tetris_core && PYO3_PYTHON="$(cd .. && pwd)/.venv/bin/python" cargo test
 ```
 
 In feature worktrees, use the primary checkout virtualenv path for `PYO3_PYTHON`.
+Native conv trunk check against a real bundle: `TETRIS_TEST_CONV_ONNX=<run>/checkpoints/incumbent.conv.onnx cargo test --release incumbent -- --nocapture` (skipped when unset).
+SIMD kernels have NEON (aarch64), runtime-detected AVX2+FMA (x86_64) and portable paths; on Apple Silicon compile-check the x86 path with `PYO3_CROSS_PYTHON_VERSION=3.12 cargo check --release --tests --target x86_64-apple-darwin` (needs `rustup target add x86_64-apple-darwin`; it cannot run without Rosetta).
 If you see `ModuleNotFoundError: No module named 'tetris_core.tetris_core'`, the native extension is missing for the active interpreter; rebuild with `make build-dev` (or `make build`) in that same `.venv`.
 
 ## Data/Artifacts Notes
