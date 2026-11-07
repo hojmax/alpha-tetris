@@ -318,6 +318,13 @@ class Trainer:
         self._cumulative_wall_time_offset_s: float = 0.0
         self._cumulative_games_offset: int = 0
         self._cumulative_examples_offset: int = 0
+        # Generator counters captured right after `generator.start()`. A replay
+        # preload seeds `games_generated` / `examples_generated` with the loaded
+        # buffer's max game number / example count, which the restored
+        # cumulative offsets above already include; subtracting the baseline
+        # keeps resumed runs from double counting the preloaded buffer.
+        self._generator_games_baseline: int = 0
+        self._generator_examples_baseline: int = 0
 
         # Create directories
         config.run.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -332,11 +339,20 @@ class Trainer:
     def _cumulative_wall_time_hours(self, now_s: float) -> float:
         return self._cumulative_wall_time_seconds(now_s) / 3600.0
 
+    def _session_examples_generated(self, generator: GameGenerator) -> int:
+        return generator.examples_generated() - self._generator_examples_baseline
+
     def _cumulative_games_generated(self, generator: GameGenerator) -> int:
-        return self._cumulative_games_offset + generator.games_generated()
+        return (
+            self._cumulative_games_offset
+            + generator.games_generated()
+            - self._generator_games_baseline
+        )
 
     def _cumulative_examples_generated(self, generator: GameGenerator) -> int:
-        return self._cumulative_examples_offset + generator.examples_generated()
+        return self._cumulative_examples_offset + self._session_examples_generated(
+            generator
+        )
 
     def _cumulative_progress_checkpoint_state(
         self, generator: GameGenerator, *, now_s: float
@@ -2461,6 +2477,8 @@ class Trainer:
         )
         self._wall_time_anchor_s = time.perf_counter()
         generator.start()
+        self._generator_games_baseline = generator.games_generated()
+        self._generator_examples_baseline = generator.examples_generated()
         self._init_r2_sync(generator)
         self._publish_incumbent_to_r2_if_enabled(generator, reason="startup")
         generator_log_fields: dict[str, object] = {
