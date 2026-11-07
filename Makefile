@@ -13,7 +13,9 @@ MATURIN_DIST := tetris_core/dist
 MATURIN_BUILD := rm -rf $(MATURIN_DIST) && $(PYTHON) -m maturin build --manifest-path tetris_core/Cargo.toml --out $(MATURIN_DIST)
 MATURIN_INSTALL := VIRTUAL_ENV=$(VENV_ABS) $(UV_BIN) pip install --no-deps --reinstall $(MATURIN_DIST)/tetris_core-*.whl
 MATURIN_ENV := $(CARGO_ENV) && export PYO3_PYTHON=$(PYO3_PYTHON)
-MATURIN_RELEASE_ENV = CARGO_PROFILE_RELEASE_LTO=$(RELEASE_LTO) CARGO_PROFILE_RELEASE_CODEGEN_UNITS=$(RELEASE_CODEGEN_UNITS) RUSTFLAGS="$(RELEASE_RUSTFLAGS)"
+# `export ... &&` so the settings reach `maturin build`; a bare `VAR=x` prefix would only
+# apply to the `rm -rf` at the start of $(MATURIN_BUILD).
+MATURIN_RELEASE_ENV = export CARGO_PROFILE_RELEASE_LTO=$(RELEASE_LTO) CARGO_PROFILE_RELEASE_CODEGEN_UNITS=$(RELEASE_CODEGEN_UNITS) RUSTFLAGS="$(RELEASE_RUSTFLAGS)" &&
 INSTALL_MARKER := $(VENV_DIR)/.install_marker
 
 # Find all Rust source files (including subdirectories)
