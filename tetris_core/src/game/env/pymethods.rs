@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::game::action_space::HOLD_ACTION_INDEX;
+use crate::game::constants::NUM_PIECE_TYPES;
 use crate::game::moves::{find_all_placement_params, find_all_placements, Board, Placement};
 use crate::game::piece::{spawn_x, spawn_y, Piece};
 use crate::game::scoring::AttackResult;
@@ -223,43 +224,9 @@ impl TetrisEnv {
     }
 
     pub fn get_possible_next_pieces(&self) -> Vec<usize> {
-        let next_position = self.pieces_spawned as usize + self.piece_queue.len();
-        let bag_number = next_position / 7;
-        let position_in_bag = next_position % 7;
-
-        if position_in_bag == 0 {
-            return (0..7).collect();
-        }
-
-        let bag_start = bag_number * 7;
-        let bag_end = bag_start + 7;
-        let mut used_in_bag = [false; 7];
-
-        let current_bag_pos = self.current_piece_bag_position as usize;
-        if current_bag_pos >= bag_start && current_bag_pos < bag_end {
-            if let Some(ref piece) = self.current_piece {
-                used_in_bag[piece.piece_type] = true;
-            }
-        }
-
-        if let (Some(hold_type), Some(hold_bag_pos)) =
-            (self.hold_piece, self.hold_piece_bag_position)
-        {
-            let hold_pos = hold_bag_pos as usize;
-            if hold_pos >= bag_start && hold_pos < bag_end {
-                used_in_bag[hold_type] = true;
-            }
-        }
-
-        for (i, &piece_type) in self.piece_queue.iter().enumerate() {
-            let piece_pos = self.pieces_spawned as usize + i;
-            if piece_pos >= bag_start && piece_pos < bag_end {
-                used_in_bag[piece_type] = true;
-            }
-        }
-
-        (0..7)
-            .filter(|piece_type| !used_in_bag[*piece_type])
+        let piece_mask = self.possible_next_piece_mask(self.piece_queue.len());
+        (0..NUM_PIECE_TYPES)
+            .filter(|&piece_type| piece_mask & (1 << piece_type) != 0)
             .collect()
     }
 

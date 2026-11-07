@@ -13,13 +13,12 @@ use crate::replay::ReplayMove;
 use super::config::MCTSConfig;
 use super::export::export_decision_node;
 use super::nodes::DecisionNode;
+use super::nodes::NO_CHANCE_OUTCOME;
 use super::results::{
     GameResult, GameStats, GameTreePlayback, GameTreeStep, MCTSResult, MCTSTreeExport,
     TrainingExample, TraversalStats, TreeNodeExport, TreeStats, TreeStatsAccumulator,
 };
-use super::search::{
-    extract_subtree, run_search, search_internal, search_internal_without_nn, NO_CHANCE_OUTCOME,
-};
+use super::search::{extract_subtree, run_search, search_internal, search_internal_without_nn};
 use crate::game::action_space::HOLD_ACTION_INDEX;
 use crate::game::constants::QUEUE_SIZE;
 
@@ -848,7 +847,7 @@ impl MCTSAgent {
 
 #[cfg(test)]
 mod tests {
-    use super::super::nodes::{DecisionNode, MCTSNode};
+    use super::super::nodes::DecisionNode;
     use super::*;
     use crate::search::NUM_ACTIONS;
 
@@ -913,33 +912,29 @@ mod tests {
 
         // The root should have children after search
         assert!(
-            !root_after.children.is_empty(),
+            root_after.has_children(),
             "Root should have children after search"
         );
 
         // Check that actions were expanded
-        if let Some(child) = root_after.children.values().next() {
-            match child {
-                MCTSNode::Chance(chance_node) => {
-                    let new_piece = chance_node.state.get_current_piece();
+        let first_child = root_after.children().next();
+        if let Some((_, chance_node)) = first_child {
+            let new_piece = chance_node.state.get_current_piece();
 
-                    // The current piece should have changed (old piece was placed, new one spawned)
-                    if let Some(ref new_p) = new_piece {
-                        assert_ne!(
-                            new_p.piece_type, initial_piece,
-                            "Current piece should have changed after placing"
-                        );
-                    }
+            // The current piece should have changed (old piece was placed, new one spawned)
+            if let Some(ref new_p) = new_piece {
+                assert_ne!(
+                    new_p.piece_type, initial_piece,
+                    "Current piece should have changed after placing"
+                );
+            }
 
-                    // The first piece from the old queue should now be current
-                    if let Some(ref new_p) = new_piece {
-                        assert_eq!(
-                            new_p.piece_type, initial_queue[0],
-                            "New current piece should be the first from old queue"
-                        );
-                    }
-                }
-                _ => panic!("First child should be a ChanceNode"),
+            // The first piece from the old queue should now be current
+            if let Some(ref new_p) = new_piece {
+                assert_eq!(
+                    new_p.piece_type, initial_queue[0],
+                    "New current piece should be the first from old queue"
+                );
             }
         }
     }
