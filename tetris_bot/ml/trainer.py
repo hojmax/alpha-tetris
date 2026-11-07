@@ -80,6 +80,7 @@ from tetris_core.tetris_core import evaluate_model
 
 logger = structlog.get_logger()
 RUNTIME_OVERRIDES_POLL_INTERVAL_SECONDS = 15.0
+REPLAY_RATIO_THROTTLE_SLEEP_SECONDS = 0.05
 
 
 def roll_interval_deadline(deadline_s: float, interval_s: float, now_s: float) -> float:
@@ -215,7 +216,7 @@ class Trainer:
         )
 
         # torch.compile is slower than eager on Apple Silicon (MPS); auto-disable
-        # there so optimizer + train loop both use the eager fast path.
+        # there so the train loop uses the eager fast path.
         self._effective_use_torch_compile = (
             config.optimizer.use_torch_compile and self.device.type != "mps"
         )
@@ -225,7 +226,6 @@ class Trainer:
             self.model,
             learning_rate=config.optimizer.learning_rate,
             weight_decay=config.optimizer.weight_decay,
-            adamw_foreach=not self._effective_use_torch_compile,
         )
 
         # Create scheduler
@@ -319,6 +319,13 @@ class Trainer:
         self._cumulative_wall_time_offset_s: float = 0.0
         self._cumulative_games_offset: int = 0
         self._cumulative_examples_offset: int = 0
+        # Generator counters captured right after `generator.start()`. A replay
+        # preload seeds `games_generated` / `examples_generated` with the loaded
+        # buffer's max game number / example count, which the restored
+        # cumulative offsets above already include; subtracting the baseline
+        # keeps resumed runs from double counting the preloaded buffer.
+        self._generator_games_baseline: int = 0
+        self._generator_examples_baseline: int = 0
 
         # Create directories
         config.run.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -333,11 +340,37 @@ class Trainer:
     def _cumulative_wall_time_hours(self, now_s: float) -> float:
         return self._cumulative_wall_time_seconds(now_s) / 3600.0
 
+    def _session_examples_generated(self, generator: GameGenerator) -> int:
+        return generator.examples_generated() - self._generator_examples_baseline
+
     def _cumulative_games_generated(self, generator: GameGenerator) -> int:
-        return self._cumulative_games_offset + generator.games_generated()
+        return (
+            self._cumulative_games_offset
+            + generator.games_generated()
+            - self._generator_games_baseline
+        )
 
     def _cumulative_examples_generated(self, generator: GameGenerator) -> int:
-        return self._cumulative_examples_offset + generator.examples_generated()
+        return self._cumulative_examples_offset + self._session_examples_generated(
+            generator
+        )
+
+    def _replay_ratio_allows_step(
+        self, generator: GameGenerator, *, session_steps: int
+    ) -> bool:
+        """Whether one more step keeps samples drawn per new example under the cap.
+
+        Counts only this session's samples and newly generated (or ingested
+        remote) examples, so a resumed run with a preloaded buffer waits for
+        fresh data instead of re-training on the already-trained window.
+        """
+        max_ratio = self.config.replay.max_train_samples_per_new_example
+        if max_ratio <= 0.0:
+            return True
+        next_session_samples = (session_steps + 1) * self.config.optimizer.batch_size
+        return next_session_samples <= max_ratio * self._session_examples_generated(
+            generator
+        )
 
     def _cumulative_progress_checkpoint_state(
         self, generator: GameGenerator, *, now_s: float
@@ -1838,9 +1871,14 @@ class Trainer:
         if not collect_metrics:
             return {}
 
-        # Only sync GPU and update loss balancer when collecting metrics
-        policy_loss_scalar = policy_loss.item()
-        value_loss_scalar = value_loss.item()
+        # Only sync GPU and update loss balancer when collecting metrics; fetch
+        # all scalars in one device->host transfer.
+        loss_scalars = [total_loss.detach(), policy_loss.detach(), value_loss.detach()]
+        if grad_norm is not None:
+            loss_scalars.append(grad_norm)
+        loss_values = torch.stack(loss_scalars).tolist()
+        total_loss_scalar, policy_loss_scalar, value_loss_scalar = loss_values[:3]
+        grad_norm_scalar = loss_values[3] if grad_norm is not None else float("nan")
         self.loss_balancer.append(policy_loss_scalar, value_loss_scalar)
         if self.loss_balancer.has_history():
             self._cached_value_loss_weight = (
@@ -1850,15 +1888,13 @@ class Trainer:
 
         policy_loss_avg, value_loss_avg = self.loss_balancer.averages()
         metrics = {
-            "train/loss": total_loss.item(),
+            "train/loss": total_loss_scalar,
             "train/policy_loss": policy_loss_scalar,
             "train/value_loss": value_loss_scalar,
             "train/policy_loss_avg": policy_loss_avg,
             "train/value_loss_avg": value_loss_avg,
             "train/value_loss_weight": value_loss_weight,
-            "train/grad_norm": grad_norm.item()
-            if grad_norm is not None
-            else float("nan"),
+            "train/grad_norm": grad_norm_scalar,
             "train/learning_rate": self.optimizer.param_groups[0]["lr"],
         }
         metrics.update(
@@ -2459,6 +2495,8 @@ class Trainer:
         )
         self._wall_time_anchor_s = time.perf_counter()
         generator.start()
+        self._generator_games_baseline = generator.games_generated()
+        self._generator_examples_baseline = generator.examples_generated()
         self._init_r2_sync(generator)
         self._publish_incumbent_to_r2_if_enabled(generator, reason="startup")
         generator_log_fields: dict[str, object] = {
@@ -2547,6 +2585,7 @@ class Trainer:
         replay_sync_count = 0
         train_step_time_s = 0.0
         train_step_count = 0
+        replay_ratio_throttle_time_s = 0.0
         latest_train_metrics: dict[str, float] | None = None
         pending_batches: deque[TrainingBatch] = deque()
         replay_mirror: CircularReplayMirror | None = None
@@ -2613,6 +2652,13 @@ class Trainer:
                     raise RuntimeError("Training log deadline is unavailable")
                 if next_checkpoint_time_s is None:
                     raise RuntimeError("Training checkpoint deadline is unavailable")
+
+                if not self._replay_ratio_allows_step(
+                    generator, session_steps=self.step - start_step
+                ):
+                    time.sleep(REPLAY_RATIO_THROTTLE_SLEEP_SECONDS)
+                    replay_ratio_throttle_time_s += time.perf_counter() - pre_step_time
+                    continue
 
                 if use_device_replay_mirror:
                     should_refresh_mirror = (
@@ -2721,8 +2767,28 @@ class Trainer:
                     metrics["replay/games_generated"] = (
                         self._cumulative_games_generated(generator)
                     )
-                    metrics["replay/examples_generated"] = (
-                        self._cumulative_examples_generated(generator)
+                    cumulative_examples_generated = self._cumulative_examples_generated(
+                        generator
+                    )
+                    metrics["replay/examples_generated"] = cumulative_examples_generated
+                    batch_size = self.config.optimizer.batch_size
+                    metrics["replay/samples_per_generated_example"] = (
+                        self.step * batch_size / cumulative_examples_generated
+                        if cumulative_examples_generated > 0
+                        else 0.0
+                    )
+                    session_examples_generated = self._session_examples_generated(
+                        generator
+                    )
+                    metrics["replay/session_samples_per_new_example"] = (
+                        session_step * batch_size / session_examples_generated
+                        if session_examples_generated > 0
+                        else 0.0
+                    )
+                    metrics["throughput/replay_ratio_throttle_fraction"] = (
+                        replay_ratio_throttle_time_s / window_elapsed_s
+                        if window_elapsed_s > 0
+                        else 0.0
                     )
                     metrics["replay/source"] = 1.0 if use_device_replay_mirror else 0.0
                     if use_device_replay_mirror:
@@ -2857,6 +2923,7 @@ class Trainer:
                     replay_sync_count = 0
                     train_step_time_s = 0.0
                     train_step_count = 0
+                    replay_ratio_throttle_time_s = 0.0
                     logger.info(
                         "Training progress",
                         step=self.step,
@@ -2875,6 +2942,12 @@ class Trainer:
                         sample_batch_ms=metrics["timing/sample_batch_ms"],
                         replay_sync_ms=metrics["timing/replay_sync_ms"],
                         train_step_ms=metrics["timing/train_step_ms"],
+                        samples_per_generated_example=metrics[
+                            "replay/samples_per_generated_example"
+                        ],
+                        replay_ratio_throttle_fraction=metrics[
+                            "throughput/replay_ratio_throttle_fraction"
+                        ],
                     )
                     next_log_time_s = roll_interval_deadline(
                         next_log_time_s,

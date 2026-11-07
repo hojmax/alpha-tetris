@@ -220,6 +220,11 @@ class ReplayConfig(ConfigModel):
     replay_mirror_refresh_seconds: float
     replay_mirror_delta_chunk_examples: int
     pin_memory_batches: bool
+    # Cap on training samples drawn per newly generated (or ingested) replay
+    # example this session; the trainer sleeps instead of stepping when it is
+    # ahead. 0 disables the cap (free-running trainer). Defaulted so configs
+    # saved before this knob existed still load.
+    max_train_samples_per_new_example: float = Field(default=0.0, ge=0.0)
 
 
 class RunConfig(ConfigModel):

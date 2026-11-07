@@ -20,16 +20,19 @@ def compute_batch_feature_metrics(
     bumpiness = aux[:, layout.bumpiness]
     holes = aux[:, layout.holes]
 
-    return {
-        "batch/value_target_mean": value_targets.mean().item(),
-        "batch/valid_actions_mean": masks.sum(dim=1).float().mean().item(),
-        "batch/board_fill_mean": total_blocks.mean().item(),
-        "batch/max_height_mean": max_column_heights.mean().item(),
-        "batch/row_fill_mean": row_fill_counts.mean().item(),
-        "batch/bumpiness_mean": bumpiness.mean().item(),
-        "batch/holes_mean": holes.mean().item(),
-        "batch/overhang_fields_mean": overhang_fields.mean().item(),
+    means = {
+        "batch/value_target_mean": value_targets.mean(),
+        "batch/valid_actions_mean": masks.sum(dim=1).float().mean(),
+        "batch/board_fill_mean": total_blocks.mean(),
+        "batch/max_height_mean": max_column_heights.mean(),
+        "batch/row_fill_mean": row_fill_counts.mean(),
+        "batch/bumpiness_mean": bumpiness.mean(),
+        "batch/holes_mean": holes.mean(),
+        "batch/overhang_fields_mean": overhang_fields.mean(),
     }
+    # One device->host transfer (a single sync) instead of one per metric.
+    values = torch.stack(list(means.values())).tolist()
+    return dict(zip(means.keys(), values, strict=True))
 
 
 def average_completed_games(
