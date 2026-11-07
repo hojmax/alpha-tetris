@@ -112,7 +112,6 @@ fn realized_chance_outcome(env: &TetrisEnv, action_reveals_new_visible_piece: bo
     if action_reveals_new_visible_piece {
         env.piece_queue
             .get(QUEUE_SIZE - 1)
-            .copied()
             .expect("Visible queue tail should exist when an action reveals a new piece")
     } else {
         NO_CHANCE_OUTCOME
@@ -560,7 +559,7 @@ impl MCTSAgent {
             if self.config.reuse_tree && should_attempt_tree_reuse {
                 if let Some(root) = root {
                     let chance_outcome = if action_reveals_new_visible_piece {
-                        env.piece_queue.get(QUEUE_SIZE - 1).copied()
+                        env.piece_queue.get(QUEUE_SIZE - 1)
                     } else {
                         Some(NO_CHANCE_OUTCOME)
                     };

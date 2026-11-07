@@ -803,9 +803,9 @@ mod tests {
         let env_a = base_env.clone();
         let mut env_b = base_env;
         let hidden_idx = QUEUE_SIZE;
-        let hidden_piece = env_a.piece_queue[hidden_idx];
+        let hidden_piece = env_a.piece_queue.get(hidden_idx).unwrap();
         let alt_hidden_piece = (hidden_piece + 1) % NUM_PIECE_TYPES;
-        env_b.piece_queue[hidden_idx] = alt_hidden_piece;
+        env_b.piece_queue.set(hidden_idx, alt_hidden_piece);
 
         let root_a = DecisionNode::new(env_a);
         let root_b = DecisionNode::new(env_b);

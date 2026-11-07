@@ -13,7 +13,7 @@ impl TetrisEnv {
     /// Ensure the piece queue has at least `count` pieces
     pub(crate) fn fill_queue(&mut self, count: usize) {
         while self.piece_queue.len() < count {
-            let mut bag: Vec<usize> = (0..7).collect();
+            let mut bag: [usize; NUM_PIECE_TYPES] = std::array::from_fn(|piece_type| piece_type);
             bag.shuffle(&mut self.rng);
             self.piece_queue.extend(bag);
         }
@@ -53,7 +53,7 @@ impl TetrisEnv {
             }
         }
 
-        for (i, &piece_type) in self.piece_queue.iter().take(queue_len).enumerate() {
+        for (i, piece_type) in self.piece_queue.iter().take(queue_len).enumerate() {
             let piece_pos = self.pieces_spawned as usize + i;
             if piece_pos >= bag_start && piece_pos < bag_end {
                 used_in_bag |= 1 << piece_type;

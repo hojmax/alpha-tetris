@@ -6,7 +6,6 @@ use pyo3::prelude::*;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::game::constants::{
@@ -14,6 +13,8 @@ use crate::game::constants::{
 };
 use crate::game::moves::PlacementParams;
 use crate::game::scoring::AttackResult;
+
+use super::piece_queue::PieceQueue;
 
 /// Placements reachable by the current piece plus hold availability. Shared (behind one
 /// `Arc`) by env clones and the per-worker placement cache.
@@ -56,7 +57,7 @@ pub struct TetrisEnv {
     pub(crate) board: [u8; MAX_BOARD_CELLS],
     pub(crate) board_piece_types: Vec<Option<usize>>,
     pub(crate) current_piece: Option<crate::game::piece::Piece>,
-    pub(crate) piece_queue: VecDeque<usize>,
+    pub(crate) piece_queue: PieceQueue,
     pub(crate) hold_piece: Option<usize>,
     pub(crate) hold_piece_bag_position: Option<u32>,
     pub(crate) hold_used: bool,
@@ -100,7 +101,7 @@ impl TetrisEnv {
             board: [0u8; MAX_BOARD_CELLS],
             board_piece_types: vec![None; width * height],
             current_piece: None,
-            piece_queue: VecDeque::new(),
+            piece_queue: PieceQueue::default(),
             hold_piece: None,
             hold_piece_bag_position: None,
             hold_used: false,

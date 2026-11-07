@@ -3,7 +3,6 @@
 //! All #[pymethods] consolidated in one file due to PyO3 limitation.
 
 use pyo3::prelude::*;
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::game::action_space::{HOLD_ACTION_INDEX, NUM_ACTIONS};
@@ -15,6 +14,7 @@ use crate::game::scoring::AttackResult;
 use super::global_cache::{
     build_placement_lookup_key, get_cached_placements, insert_cached_placements,
 };
+use super::piece_queue::PieceQueue;
 use super::state::PlacementSet;
 use super::TetrisEnv;
 
@@ -145,7 +145,7 @@ impl TetrisEnv {
             }
         }
 
-        self.piece_queue = VecDeque::from(queue);
+        self.piece_queue = PieceQueue::from_piece_types(&queue);
         Ok(())
     }
 
@@ -190,7 +190,7 @@ impl TetrisEnv {
     }
 
     pub fn get_next_piece(&self) -> Option<Piece> {
-        self.piece_queue.front().map(|&pt| Piece::new(pt))
+        self.piece_queue.front().map(Piece::new)
     }
 
     #[pyo3(signature = (count=5))]
@@ -198,13 +198,13 @@ impl TetrisEnv {
         self.piece_queue
             .iter()
             .take(count)
-            .map(|&pt| Piece::new(pt))
+            .map(Piece::new)
             .collect()
     }
 
     #[pyo3(signature = (count=5))]
     pub fn get_queue(&self, count: usize) -> Vec<usize> {
-        self.piece_queue.iter().take(count).cloned().collect()
+        self.piece_queue.iter().take(count).collect()
     }
 
     pub fn get_queue_len(&self) -> usize {
@@ -239,9 +239,7 @@ impl TetrisEnv {
     /// Truncate the queue to at most `max_len` pieces.
     /// Used by MCTS to limit queue to visible pieces before creating chance nodes.
     pub fn truncate_queue(&mut self, max_len: usize) {
-        while self.piece_queue.len() > max_len {
-            self.piece_queue.pop_back();
-        }
+        self.piece_queue.truncate(max_len);
     }
 
     pub fn hold(&mut self) -> bool {
