@@ -63,7 +63,7 @@ def test_remember_recent_completed_replays_keeps_only_recent_replays(
     assert recent_completed_replays[0].replay is retained_replay
 
 
-def test_build_direct_sync_recent_game_wandb_data_logs_random_recent_game(
+def test_select_direct_sync_recent_game_picks_random_recent_replay(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -88,35 +88,44 @@ def test_build_direct_sync_recent_game_wandb_data_logs_random_recent_game(
     )
 
     monkeypatch.setattr("tetris_bot.ml.trainer.random.choice", lambda items: items[0])
-    monkeypatch.setattr(
-        "tetris_bot.ml.trainer.render_replay",
-        lambda replay: ["frame"] if replay is selected_replay else [],
-    )
 
-    def fake_create_wandb_gif_video(
-        frames: list[str],
-        attack: int,
-        *,
-        gif_stem: str | None = None,
-    ) -> tuple[str, None]:
-        assert frames == ["frame"]
-        assert attack == 34
-        assert gif_stem == "direct_sync_step0_game9_attack34"
-        return "video", None
-
-    monkeypatch.setattr(trainer, "_create_wandb_gif_video", fake_create_wandb_gif_video)
-
-    wandb_data = trainer._build_direct_sync_recent_game_wandb_data(
+    selection = trainer._select_direct_sync_recent_game(
         recent_completed_replays,
         now_s=100.0,
         window_s=10.0,
     )
 
     assert [entry.game_number for entry in recent_completed_replays] == [9]
-    assert wandb_data == {
-        "model_sync/random_recent_game": "video",
+    assert selection is not None
+    data, gifs = selection
+    assert data == {
+        "trainer_step": 0,
         "model_sync/random_recent_game_number": 9.0,
         "model_sync/random_recent_game_attack": 34.0,
         "model_sync/random_recent_game_age_seconds": 5.0,
         "model_sync/random_recent_game_window_seconds": 10.0,
     }
+    replay, gif_path = gifs["model_sync/random_recent_game"]
+    assert replay is selected_replay
+    assert gif_path.name == "direct_sync_step0_game9_attack34.gif"
+
+
+def test_select_direct_sync_recent_game_skips_empty_window(tmp_path: Path) -> None:
+    trainer = _make_trainer(tmp_path)
+    recent_completed_replays: deque[CompletedGameLogEntry] = deque(
+        [
+            CompletedGameLogEntry(
+                game_number=4,
+                stats={"total_attack": 12.0},
+                completed_time_s=50.0,
+                replay=object(),
+            )
+        ]
+    )
+
+    assert (
+        trainer._select_direct_sync_recent_game(
+            recent_completed_replays, now_s=100.0, window_s=10.0
+        )
+        is None
+    )

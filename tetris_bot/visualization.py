@@ -7,7 +7,9 @@ Renders Tetris board states to PIL Images for logging to wandb.
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Protocol
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -19,7 +21,24 @@ from tetris_bot.constants import (
     PIECE_SPAWN_CELLS,
     QUEUE_SIZE,
 )
-from tetris_core.tetris_core import GameReplay, TetrisEnv
+from tetris_core.tetris_core import TetrisEnv
+
+
+class ReplayMoveLike(Protocol):
+    @property
+    def action(self) -> int: ...
+    @property
+    def attack(self) -> int: ...
+
+
+class ReplayLike(Protocol):
+    """A Rust `GameReplay` or a picklable stand-in with the same fields."""
+
+    @property
+    def seed(self) -> int: ...
+    @property
+    def moves(self) -> Sequence[ReplayMoveLike]: ...
+
 
 # Board cell size
 CELL_SIZE = 20
@@ -767,7 +786,7 @@ def _capture_frame(
     )
 
 
-def render_replay(replay: GameReplay) -> list[Image.Image]:
+def render_replay(replay: ReplayLike) -> list[Image.Image]:
     final_total_attack, final_total_placements = _compute_replay_totals(replay)
 
     env = TetrisEnv.with_seed(BOARD_WIDTH, BOARD_HEIGHT, replay.seed)
@@ -808,7 +827,7 @@ def render_replay(replay: GameReplay) -> list[Image.Image]:
     return frames
 
 
-def _compute_replay_totals(replay: GameReplay) -> tuple[int, int]:
+def _compute_replay_totals(replay: ReplayLike) -> tuple[int, int]:
     """Simulate the replay once to determine the final attack and placement counts."""
     env = TetrisEnv.with_seed(BOARD_WIDTH, BOARD_HEIGHT, replay.seed)
     total_attack = 0
