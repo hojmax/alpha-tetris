@@ -50,6 +50,7 @@ from tetris_bot.ml.weights import (
     split_model_paths,
 )
 from tetris_bot.ml.loss import RunningLossBalancer, compute_loss, compute_metrics
+from tetris_bot.ml.attack_histogram_log import RecentAttackHistogram
 from tetris_bot.ml.artifacts import (
     assert_rust_inference_artifacts,
     copy_model_artifact_bundle,
@@ -2783,6 +2784,11 @@ class Trainer:
         direct_sync_interval_seconds: float | None = None
         next_model_sync_time_s: float | None = None
         recent_completed_replays: deque[CompletedGameLogEntry] = deque()
+        attack_histogram = RecentAttackHistogram(
+            window_games=self.config.run.attack_histogram_window_games,
+            interval_seconds=self.config.run.attack_histogram_interval_seconds,
+            now_s=interval_anchor_s,
+        )
         if candidate_gating_enabled:
             candidate_gate_schedule = self._initialize_candidate_gate_schedule(
                 now_s=interval_anchor_s
@@ -3041,6 +3047,7 @@ class Trainer:
                         (completed_game.game_number, completed_game.stats)
                         for completed_game in completed_games
                     ]
+                    attack_histogram.record(completed_game_stats)
                     if direct_sync_interval_seconds is not None:
                         self._remember_recent_completed_replays(
                             recent_completed_replays,
@@ -3099,6 +3106,12 @@ class Trainer:
                                     game_avg_metrics["game/total_attack"]
                                 )
                                 wandb.log(game_avg_metrics)
+                        if attack_histogram.is_due(post_step_time):
+                            histogram_metrics = attack_histogram.wandb_payload(
+                                post_step_time
+                            )
+                            histogram_metrics["trainer_step"] = self.step
+                            wandb.log(histogram_metrics)
                     sample_batch_time_s = 0.0
                     sample_batch_count = 0
                     replay_sync_time_s = 0.0
