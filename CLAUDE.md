@@ -64,6 +64,7 @@ make train      # training entry point (requires tmux; auto-loads machine optimi
 make warm-start # create a new warm-started run dir from another run's training_data.npz
 make compare-offline-spatial-policy # compare current gated fusion vs 4x20x10 spatial policy decoder offline
 make compare-warm-start-trunk-sizes # warm-start several trunk sizes from one replay buffer, then benchmark attack vs throughput
+make search-depth-info-gain # Leela-style policy information gain per MCTS visit (see investigations/optimal_search_depth/)
 make profile    # performance profile runner
 make optimize   # auto-tune build/backend/workers for this machine (with cache)
 ```
@@ -152,8 +153,8 @@ Ownership split:
 ## Important Defaults (TrainingConfig)
 
 - Network: `trunk_channels=32`, `num_conv_residual_blocks=5`, `reduction_channels=32`, `board_stats_hidden=32`, `board_proj_hidden=512`, `fc_hidden=256`, `aux_hidden=128`, `fusion_hidden=256`, `num_fusion_blocks=1`.
-- MCTS: `num_simulations=2000`, `c_puct=1.5`, `temperature=1.0`, `reuse_tree=true`, `max_placements=50`.
-- Search budget: by default every move adds `num_simulations` new simulations on top of the visits carried in by tree reuse (~37% of a root's final visits at 2000 sims). `self_play.count_reused_visits=true` turns `num_simulations` into a per-search visit budget (new sims = `max(min_new_simulations, num_simulations - carried)`); default off. At a fixed network, budget 2000 (min 200) ran 1.54x faster than today's setting for -0.7 greedy attack (50.0 vs 50.8, 144 seeds). That is about the same trade as lowering `num_simulations` (plain 1000 sims: 49.3 at 0.55x cost); 144 games cannot tell the two apart.
+- MCTS: `num_simulations=500` (policy info-gain plateau 240-542 sims; 500 keeps ~95% of 2000-sim attack at 3.1x throughput; see `investigations/optimal_search_depth/`), `c_puct=1.5`, `temperature=1.0`, `reuse_tree=true`, `max_placements=50`.
+- Search budget: by default every move adds `num_simulations` new simulations on top of the visits carried in by tree reuse (~37% of a root's final visits, measured at 2000 sims). `self_play.count_reused_visits=true` turns `num_simulations` into a per-search visit budget (new sims = `max(min_new_simulations, num_simulations - carried)`); default off. At a fixed network, budget 2000 (min 200) ran 1.54x faster than plain 2000 sims for -0.7 greedy attack (50.0 vs 50.8, 144 seeds), about the same trade as lowering `num_simulations` (plain 1000 sims: 49.3 at 0.55x cost); 144 games cannot tell the two apart. Not measured at the 500-sim default.
 - Training: `batch_size=2048`, `learning_rate=5e-4` with linear decay to `1e-4`, `weight_decay=5e-5`, `grad_clip_norm=10.0`.
 - Workers/buffer: `num_workers=7`, replay ring buffer size `7_000_000`.
 - Replay ratio: the trainer is free-running by default (`replay.max_train_samples_per_new_example=0`). The user's 32-worker CUDA run drew ~320 training samples per generated example (11.6 steps/s x 2048 vs ~75 examples/s), so trainer speedups do not speed learning; self-play throughput does. Set the cap (> 0) to make the trainer sleep whenever this session's samples drawn exceed `cap x` newly generated/ingested examples (preloaded replay does not count). Logged as `replay/samples_per_generated_example`, `replay/session_samples_per_new_example`, `throughput/replay_ratio_throttle_fraction`.

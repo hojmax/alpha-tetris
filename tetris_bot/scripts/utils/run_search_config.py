@@ -148,6 +148,9 @@ def build_mcts_config(
     )
     config.max_placements = int(config_data["max_placements"])
     config.reuse_tree = bool(config_data.get("reuse_tree", True))
+    config.use_parent_value_for_unvisited_q = bool(
+        config_data["use_parent_value_for_unvisited_q"]
+    )
     config.count_reused_visits = bool(config_data.get("count_reused_visits", False))
     config.min_new_simulations = int(config_data.get("min_new_simulations", 0))
     config.nn_value_weight = float(nn_schedule.get("initial", config.nn_value_weight))

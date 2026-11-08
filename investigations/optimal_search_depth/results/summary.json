@@ -1,0 +1,109 @@
+{
+  "headline": {
+    "ground_truth_simulations": 65536,
+    "alpha": 1.0,
+    "optimal_simulations": 273,
+    "optimal_nats_per_visit": 9.809280464660002e-05,
+    "bootstrap_95ci_simulations": [
+      220.0,
+      796.0
+    ],
+    "within_90pct_of_peak_simulations": [
+      240,
+      542
+    ],
+    "reference_simulations": 2000,
+    "reference_nats_per_visit": 5.7505980900595306e-05,
+    "reference_relative_efficiency": 0.5862405617595776,
+    "kl_prior_vs_ground_truth_mean": 0.31855258107242373,
+    "kl_at_reference_mean": 0.2035406192712332
+  },
+  "sensitivity": [
+    {
+      "ground_truth_simulations": 16384,
+      "alpha": 0.25,
+      "peak_simulations": 437,
+      "peak_nats_per_visit": 8.95539871426959e-05
+    },
+    {
+      "ground_truth_simulations": 16384,
+      "alpha": 1.0,
+      "peak_simulations": 285,
+      "peak_nats_per_visit": 0.00010007299813369286
+    },
+    {
+      "ground_truth_simulations": 16384,
+      "alpha": 4.0,
+      "peak_simulations": 273,
+      "peak_nats_per_visit": 0.00011409868563029029
+    },
+    {
+      "ground_truth_simulations": 32768,
+      "alpha": 0.25,
+      "peak_simulations": 437,
+      "peak_nats_per_visit": 9.009639107562453e-05
+    },
+    {
+      "ground_truth_simulations": 32768,
+      "alpha": 1.0,
+      "peak_simulations": 297,
+      "peak_nats_per_visit": 0.00010090853897447122
+    },
+    {
+      "ground_truth_simulations": 32768,
+      "alpha": 4.0,
+      "peak_simulations": 273,
+      "peak_nats_per_visit": 0.00011469375253754567
+    },
+    {
+      "ground_truth_simulations": 65536,
+      "alpha": 0.25,
+      "peak_simulations": 437,
+      "peak_nats_per_visit": 8.563619743173622e-05
+    },
+    {
+      "ground_truth_simulations": 65536,
+      "alpha": 1.0,
+      "peak_simulations": 273,
+      "peak_nats_per_visit": 9.809280464660002e-05
+    },
+    {
+      "ground_truth_simulations": 65536,
+      "alpha": 4.0,
+      "peak_simulations": 273,
+      "peak_nats_per_visit": 0.000113189850096917
+    }
+  ],
+  "num_states": 2249,
+  "num_games": 96,
+  "mean_valid_actions": 24.71009337483326,
+  "mean_prior_entropy": 0.793863153277168,
+  "mean_ground_truth_entropy": 0.38817880980259895,
+  "mean_analysis_seconds_per_state": 15.569355215049757,
+  "args": {
+    "run_dir": "/Users/axelhojmark/alpha-tetris/training_runs/drive_final",
+    "model_path": null,
+    "output_dir": "/Users/axelhojmark/tetris-mcts-worktrees/search-depth-info-gain/investigations/optimal_search_depth/results",
+    "num_games": 96,
+    "seed_start": 10000,
+    "state_stride": 3,
+    "trajectory_add_noise": true,
+    "trajectory_num_simulations": null,
+    "ground_truth_simulations": [
+      16384,
+      32768,
+      65536
+    ],
+    "smoothing_alphas": [
+      0.25,
+      1.0,
+      4.0
+    ],
+    "headline_alpha": 1.0,
+    "num_grid_points": 260,
+    "reference_simulations": 2000,
+    "num_workers": 16,
+    "num_bootstrap": 1000,
+    "plot_only": true
+  }
+}

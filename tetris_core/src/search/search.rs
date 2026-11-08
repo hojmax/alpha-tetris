@@ -680,7 +680,13 @@ pub(super) fn search_internal(
     TraversalStats,
     (f32, f32),
 ) {
-    let evaluator = NeuralLeafEvaluator {
+    let evaluator = neural_leaf_evaluator(config, nn);
+    let root = neural_root(config, env, &policy, nn_value);
+    run_search(config, &evaluator, root, add_noise)
+}
+
+fn neural_leaf_evaluator<'a>(config: &MCTSConfig, nn: &'a TetrisNN) -> NeuralLeafEvaluator<'a> {
+    NeuralLeafEvaluator {
         nn,
         nn_value_weight: config.nn_value_weight,
         prediction_noise: PredictionNoiseSettings {
@@ -690,15 +696,84 @@ pub(super) fn search_internal(
             value_std: config.value_noise_std,
             seed: config.prediction_noise_seed,
         },
-    };
+    }
+}
+
+fn neural_root(
+    config: &MCTSConfig,
+    env: &TetrisEnv,
+    policy: &[f32],
+    nn_value: f32,
+) -> DecisionNode {
     let mut root = DecisionNode::new(env.clone());
     root.set_nn_output_with_raw(
-        &policy,
+        policy,
         nn_value,
         scale_nn_value(nn_value, config.nn_value_weight),
     );
     root.set_initial_total_value_estimate(root.state.attack as f32 + root.nn_value);
-    run_search(config, &evaluator, root, add_noise)
+    root
+}
+
+/// Run one fresh NN-guided search (no root noise) and record the root action visit
+/// counts after each requested simulation count.
+///
+/// Because simulations are sequential, the snapshot at `k` is exactly the tree a
+/// standalone `k`-simulation search would produce with the same seed, so a single long
+/// search yields the whole visit-count trajectory. `snapshot_counts` must be ascending.
+pub(super) fn search_root_visit_snapshots(
+    config: &MCTSConfig,
+    nn: &TetrisNN,
+    env: &TetrisEnv,
+    policy: &[f32],
+    nn_value: f32,
+    snapshot_counts: &[u32],
+) -> Vec<Vec<u32>> {
+    let evaluator = neural_leaf_evaluator(config, nn);
+    let root = neural_root(config, env, policy, nn_value);
+    root_visit_snapshots(config, &evaluator, root, snapshot_counts)
+}
+
+fn root_visit_snapshots<E: LeafEvaluator>(
+    config: &MCTSConfig,
+    evaluator: &E,
+    mut root: DecisionNode,
+    snapshot_counts: &[u32],
+) -> Vec<Vec<u32>> {
+    assert!(
+        snapshot_counts.windows(2).all(|w| w[0] <= w[1]),
+        "snapshot_counts must be ascending"
+    );
+    let mut rng = create_search_rng(config, &root.state);
+    let mut q_bounds = seed_q_bounds_from_tree(&root);
+    let mut path = SimulationPath::new();
+
+    let mut snapshots = Vec::with_capacity(snapshot_counts.len());
+    let mut completed: u32 = 0;
+    for &target in snapshot_counts {
+        while completed < target {
+            simulate(
+                config,
+                evaluator,
+                &mut root,
+                &mut rng,
+                &mut q_bounds,
+                &mut path,
+            );
+            completed += 1;
+        }
+        snapshots.push(root_action_visits(&root));
+    }
+    snapshots
+}
+
+/// Root visit counts indexed by action index (zero for unexpanded actions).
+fn root_action_visits(root: &DecisionNode) -> Vec<u32> {
+    let mut visits = vec![0u32; NUM_ACTIONS];
+    for (action_idx, child) in root.children() {
+        visits[action_idx] = child.visit_count;
+    }
+    visits
 }
 
 /// Run MCTS search without NN guidance (uniform priors and zero value).
@@ -784,6 +859,39 @@ mod tests {
                 raw_value: self.value,
                 value: self.value,
             })
+        }
+    }
+
+    #[test]
+    fn test_root_visit_snapshots_match_standalone_searches() {
+        let env = TetrisEnv::with_seed(10, 20, 42);
+        let mut config = MCTSConfig::default();
+        config.seed = Some(7);
+        let make_root = || {
+            let root_policy = uniform_action_priors_for_valid_actions(
+                env.get_cached_valid_action_indices().len(),
+            );
+            let mut root = DecisionNode::new(env.clone());
+            root.set_nn_output_for_valid_actions(&root_policy, 0.0);
+            root.set_initial_total_value_estimate(root.state.attack as f32);
+            root
+        };
+
+        let evaluator = ConstantEvaluator { value: 0.5 };
+        let snapshot_counts = [0, 1, 5, 40, 120];
+        let snapshots = root_visit_snapshots(&config, &evaluator, make_root(), &snapshot_counts);
+
+        assert_eq!(snapshots.len(), snapshot_counts.len());
+        assert!(snapshots[0].iter().all(|&v| v == 0));
+        for (&count, snapshot) in snapshot_counts.iter().zip(&snapshots).skip(1) {
+            config.num_simulations = count;
+            let (_, root, _, _, _) = run_search(&config, &evaluator, make_root(), false);
+            assert_eq!(
+                snapshot,
+                &root_action_visits(&root),
+                "snapshot at {count} sims diverged"
+            );
+            assert_eq!(snapshot.iter().sum::<u32>(), count);
         }
     }
 

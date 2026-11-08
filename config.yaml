@@ -31,7 +31,7 @@ optimizer:
   mirror_augmentation_probability: 0.5
   log_individual_games_to_wandb: false
 self_play:
-  num_simulations: 2000
+  num_simulations: 500  # info-gain plateau + eval sweep, see investigations/optimal_search_depth
   c_puct: 1.5
   temperature: 1.0
   dirichlet_alpha: 0.02

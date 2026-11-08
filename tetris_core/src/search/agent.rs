@@ -18,7 +18,10 @@ use super::results::{
     GameResult, GameStats, GameTreePlayback, GameTreeStep, MCTSResult, MCTSTreeExport,
     TrainingExample, TraversalStats, TreeNodeExport, TreeStats, TreeStatsAccumulator,
 };
-use super::search::{extract_subtree, run_search, search_internal, search_internal_without_nn};
+use super::search::{
+    extract_subtree, run_search, search_internal, search_internal_without_nn,
+    search_root_visit_snapshots,
+};
 use crate::game::action_space::HOLD_ACTION_INDEX;
 use crate::game::constants::QUEUE_SIZE;
 
@@ -438,6 +441,40 @@ impl MCTSAgent {
         let (mcts_result, _root, _tree_stats, _traversal_stats, _q_bounds) =
             search_internal(&self.config, nn, env, policy, nn_value, add_noise);
         Some(mcts_result)
+    }
+
+    /// Run one fresh search (no root noise) and snapshot root action visit counts after
+    /// each requested simulation count. `config.num_simulations` is ignored.
+    ///
+    /// Args:
+    ///     env: The game state to search from
+    ///     snapshot_counts: Ascending simulation counts at which to record root visits
+    ///
+    /// Returns:
+    ///     Tuple of (masked NN prior policy, per-snapshot root visit counts), or None if
+    ///     no model is loaded or the state has no valid actions
+    pub fn search_root_visit_snapshots(
+        &self,
+        env: &TetrisEnv,
+        snapshot_counts: Vec<u32>,
+    ) -> Option<(Vec<f32>, Vec<Vec<u32>>)> {
+        let nn = self.nn.as_ref()?;
+        let mask = crate::inference::get_action_mask(env);
+        if !mask.iter().any(|&x| x) {
+            return None;
+        }
+
+        let (policy, nn_value) = nn
+            .predict_masked(
+                env,
+                &mask,
+                self.config.max_placements as usize,
+                prediction_noise_from_config(&self.config),
+            )
+            .expect("Neural network prediction failed");
+        let snapshots =
+            search_root_visit_snapshots(&self.config, nn, env, &policy, nn_value, &snapshot_counts);
+        Some((policy, snapshots))
     }
 }
 

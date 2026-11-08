@@ -21,3 +21,4 @@ benchmarks/profiles/optimize_latest.*
 tetris_core/dist/
 benchmarks/
 generator_workspace/
+investigations/*/results/*.npz
