@@ -10,7 +10,6 @@ Output: docs/loss_tradeoff_mock.png
 
 from __future__ import annotations
 
-from pathlib import Path
 
 import matplotlib
 import numpy as np
