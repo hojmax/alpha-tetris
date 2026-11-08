@@ -64,7 +64,7 @@ self_play:
   bootstrap_num_simulations: 4000
   save_eval_trees: false
 replay:
-  buffer_size: 10000000
+  buffer_size: 5000000  # 5M replay mirror fits a 24 GB card next to training
   min_buffer_size: 10000
   prefetch_batches: 1
   staged_batch_cache_batches: 1
