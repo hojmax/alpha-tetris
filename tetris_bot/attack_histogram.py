@@ -137,7 +137,7 @@ def draw_attack_histogram(
         ax.set_axisbelow(True)
         ax.margins(x=0.02)
         ax.tick_params(length=0)
-        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True, steps=[1, 2, 5, 10]))
         ax.legend(
             [handle for handle, _ in legend_handles],
             [text for _, text in legend_handles],
