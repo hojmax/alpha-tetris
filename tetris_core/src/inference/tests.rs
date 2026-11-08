@@ -724,7 +724,8 @@ fn bench_heads_latency_probe() {
             let value = nn
                 .run_heads_trunk(&envs[i % envs.len()], aux, &mut scratch)
                 .unwrap();
-            nn.heads
+            nn.weights
+                .heads
                 .policy_logits(&scratch, valid, &mut logits[..valid.len()]);
             acc += value + logits[0];
         }
@@ -763,8 +764,8 @@ fn native_heads_match_f64_reference_on_real_states() {
     let nn = TetrisNN::load(&model_path).expect("load");
     let heads_path = Path::new(&model_path).with_extension("heads.onnx");
     let (weights, aux_layers, blocks) = heads::reference::load_weights(&heads_path);
-    let mut scratch = nn.heads.new_scratch();
-    let mut board_input = vec![0.0; nn.heads.board_fusion_width()];
+    let mut scratch = nn.weights.heads.new_scratch();
+    let mut board_input = vec![0.0; nn.weights.heads.board_fusion_width()];
     let (mut max_value_rel, mut max_logit_abs, mut max_prob_abs) = (0.0f64, 0.0f64, 0.0f64);
     let mut states = 0;
     for seed in 0..40u64 {
@@ -782,10 +783,14 @@ fn native_heads_match_f64_reference_on_real_states() {
                 .unwrap();
             let board_h = board_h.as_slice().unwrap();
             let aux = encode_piece_aux_features(&env, 50).unwrap();
-            nn.heads
+            nn.weights
+                .heads
                 .board_fusion_input(board_h, &mut scratch, &mut board_input);
-            let value = nn.heads.forward_trunk(&board_input, &aux, &mut scratch);
-            let logits = nn.heads.all_policy_logits(&scratch);
+            let value = nn
+                .weights
+                .heads
+                .forward_trunk(&board_input, &aux, &mut scratch);
+            let logits = nn.weights.heads.all_policy_logits(&scratch);
             let (ref_logits, ref_value) =
                 heads::reference::forward(&weights, aux_layers, blocks, board_h, &aux);
 

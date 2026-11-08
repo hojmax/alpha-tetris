@@ -153,6 +153,7 @@ Ownership split:
 
 - Network: `trunk_channels=32`, `num_conv_residual_blocks=5`, `reduction_channels=32`, `board_stats_hidden=32`, `board_proj_hidden=512`, `fc_hidden=256`, `aux_hidden=128`, `fusion_hidden=256`, `num_fusion_blocks=1`.
 - MCTS: `num_simulations=2000`, `c_puct=1.5`, `temperature=1.0`, `reuse_tree=true`, `max_placements=50`.
+- Search budget: by default every move adds `num_simulations` new simulations on top of the visits carried in by tree reuse (~37% of a root's final visits at 2000 sims). `self_play.count_reused_visits=true` turns `num_simulations` into a per-search visit budget (new sims = `max(min_new_simulations, num_simulations - carried)`); default off. At a fixed network, budget 2000 (min 200) ran 1.54x faster than today's setting for -0.7 greedy attack (50.0 vs 50.8, 144 seeds).
 - Training: `batch_size=2048`, `learning_rate=5e-4` with linear decay to `1e-4`, `weight_decay=5e-5`, `grad_clip_norm=10.0`.
 - Workers/buffer: `num_workers=7`, replay ring buffer size `7_000_000`.
 - Replay ratio: the trainer is free-running by default (`replay.max_train_samples_per_new_example=0`). The user's 32-worker CUDA run drew ~320 training samples per generated example (11.6 steps/s x 2048 vs ~75 examples/s), so trainer speedups do not speed learning; self-play throughput does. Set the cap (> 0) to make the trainer sleep whenever this session's samples drawn exceed `cap x` newly generated/ingested examples (preloaded replay does not count). Logged as `replay/samples_per_generated_example`, `replay/session_samples_per_new_example`, `throughput/replay_ratio_throttle_fraction`.
@@ -166,8 +167,9 @@ Ownership split:
 Memory note:
 
 - CPU RAM usually becomes the bottleneck before GPU VRAM.
+- Model weights are shared process-wide: `TetrisNN::load` goes through `inference/weight_registry.rs`, so all workers loading the same bundle (same canonical paths, sizes, mtimes) share one `Arc<ModelWeights>` and old models are freed when the last worker drops them. Private per-worker copies made multi-worker self-play DRAM-bandwidth-bound (M5 Pro, 18 workers: 27.1 -> 52.6 placements/s from sharing alone). Don't add load paths that bypass it.
 - Biggest levers: `buffer_size`, `num_workers`, `bootstrap_num_simulations`, replay mirror/staging settings.
-- Rust per-worker caches scale with worker count: the placement cache (`PLACEMENT_CACHE_MAX_ENTRIES` = 30K entries, ~1 KB each) and the NN board-embedding cache (`BOARD_CACHE_MAX_ENTRIES` = 1M entries, ~1.1 KB each, ~1.1 GB per worker when full). Board overhang/hole analysis is computed directly (bitboard), with no global cache.
+- Rust per-worker caches scale with worker count: the placement cache (`PLACEMENT_CACHE_MAX_ENTRIES` = 30K entries, ~1 KB each) and the NN board-embedding cache (`BOARD_CACHE_MAX_ENTRIES` = 64K entries, ~1 KB each, ~64 MB per worker when full; a game misses only ~2.4-4.1K boards and later games never hit earlier games' entries, so the old 1M cap only cost ~1.1 GB/worker). Board overhang/hole analysis is computed directly (bitboard), with no global cache.
 
 Disk note:
 

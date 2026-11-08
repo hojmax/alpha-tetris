@@ -43,16 +43,17 @@ mod kernels;
 mod onnx_proto;
 #[cfg(test)]
 mod tests;
+mod weight_registry;
 
 use board_cache::{BoardCache, BoardKey};
 use board_embedding::{BoardEmbedder, BoardEmbeddingScratch};
 use heads::{HeadsModel, HeadsScratch};
+use weight_registry::{BundleKey, WeakRegistry};
 
 /// Neural network model wrapper with board embedding cache
 pub struct TetrisNN {
-    board_embedder: Arc<BoardEmbedder>,
+    weights: Arc<ModelWeights>,
     board_scratch: RefCell<BoardEmbeddingScratch>,
-    heads: Arc<HeadsModel>,
     /// Packed board -> board-only fusion input (`HeadsModel::board_fusion_input`).
     board_cache: RefCell<BoardCache>,
     heads_scratch: RefCell<HeadsScratch>,
@@ -61,6 +62,16 @@ pub struct TetrisNN {
     cache_misses: Cell<u64>,
     cache_enabled: Cell<bool>,
 }
+
+/// Immutable weights of one model bundle, shared by every `TetrisNN` loaded from it.
+struct ModelWeights {
+    board_embedder: BoardEmbedder,
+    heads: HeadsModel,
+}
+
+/// One copy of each bundle's weights per process (see `weight_registry`).
+static MODEL_WEIGHTS: std::sync::OnceLock<WeakRegistry<BundleKey, ModelWeights>> =
+    std::sync::OnceLock::new();
 
 #[derive(Clone)]
 struct LinearLayer {
@@ -113,23 +124,39 @@ impl TetrisNN {
         let heads_path = base.with_extension("heads.onnx");
         let fc_path = base.with_extension("fc.bin");
 
-        let board_embedder = BoardEmbedder::load(&conv_path, &load_fc_binary(&fc_path)?)?;
-        let heads = HeadsModel::load(&heads_path, board_embedder.output_size())?;
+        let key = BundleKey::for_files(&[&conv_path, &heads_path, &fc_path])?;
+        let weights = MODEL_WEIGHTS
+            .get_or_init(WeakRegistry::new)
+            .get_or_try_insert_with(key, || -> TractResult<ModelWeights> {
+                let board_embedder = BoardEmbedder::load(&conv_path, &load_fc_binary(&fc_path)?)?;
+                let heads = HeadsModel::load(&heads_path, board_embedder.output_size())?;
+                Ok(ModelWeights {
+                    board_embedder,
+                    heads,
+                })
+            })?;
+        Ok(Self::from_weights(weights, BOARD_CACHE_MAX_ENTRIES, true))
+    }
 
-        Ok(TetrisNN {
-            board_scratch: RefCell::new(board_embedder.new_scratch()),
-            board_embedder: Arc::new(board_embedder),
+    /// Per-instance scratch buffers, board cache and counters around shared weights.
+    fn from_weights(
+        weights: Arc<ModelWeights>,
+        cache_capacity: usize,
+        cache_enabled: bool,
+    ) -> Self {
+        TetrisNN {
+            board_scratch: RefCell::new(weights.board_embedder.new_scratch()),
             board_cache: RefCell::new(BoardCache::new(
-                heads.board_fusion_width(),
-                BOARD_CACHE_MAX_ENTRIES,
+                weights.heads.board_fusion_width(),
+                cache_capacity,
             )),
-            heads_scratch: RefCell::new(heads.new_scratch()),
-            heads: Arc::new(heads),
-            cache_capacity: BOARD_CACHE_MAX_ENTRIES,
+            heads_scratch: RefCell::new(weights.heads.new_scratch()),
+            weights,
+            cache_capacity,
             cache_hits: Cell::new(0),
             cache_misses: Cell::new(0),
-            cache_enabled: Cell::new(true),
-        })
+            cache_enabled: Cell::new(cache_enabled),
+        }
     }
 
     fn compute_board_embedding(
@@ -139,6 +166,7 @@ impl TetrisNN {
     ) -> TractResult<Array1<f32>> {
         let mut scratch = self.board_scratch.borrow_mut();
         let board_h = self
+            .weights
             .board_embedder
             .embed(board_f32, board_stats, &mut scratch)?;
         Ok(Array1::from(board_h.to_vec()))
@@ -158,8 +186,11 @@ impl TetrisNN {
         out: &mut [f32],
     ) -> TractResult<()> {
         let board_embed = self.compute_board_embedding(board_f32, board_stats)?;
-        self.heads
-            .board_fusion_input(contiguous_board_embedding(&board_embed)?, scratch, out);
+        self.weights.heads.board_fusion_input(
+            contiguous_board_embedding(&board_embed)?,
+            scratch,
+            out,
+        );
         Ok(())
     }
 
@@ -173,14 +204,17 @@ impl TetrisNN {
         scratch: &mut HeadsScratch,
     ) -> TractResult<f32> {
         if !self.cache_enabled.get() {
-            let mut board_input = vec![0.0; self.heads.board_fusion_width()];
+            let mut board_input = vec![0.0; self.weights.heads.board_fusion_width()];
             self.compute_board_fusion_input(
                 &encode_board_features(env),
                 &encode_board_stats(env),
                 scratch,
                 &mut board_input,
             )?;
-            return Ok(self.heads.forward_trunk(&board_input, piece_aux, scratch));
+            return Ok(self
+                .weights
+                .heads
+                .forward_trunk(&board_input, piece_aux, scratch));
         }
 
         let board_key = BoardKey(pack_board(env));
@@ -198,11 +232,14 @@ impl TetrisNN {
                 )?;
                 let board_embed = contiguous_board_embedding(&board_embed)?;
                 let (slot, row) = cache.insert(board_key);
-                self.heads.board_fusion_input(board_embed, scratch, row);
+                self.weights
+                    .heads
+                    .board_fusion_input(board_embed, scratch, row);
                 slot
             }
         };
         Ok(self
+            .weights
             .heads
             .forward_trunk(cache.row(slot), piece_aux, scratch))
     }
@@ -287,11 +324,11 @@ impl TetrisNN {
         max_placements: usize,
         prediction_noise: PredictionNoiseSettings,
     ) -> TractResult<(Vec<f32>, f32)> {
-        self.validate_policy_output_len(self.heads.num_actions(), action_mask.len())?;
+        self.validate_policy_output_len(self.weights.heads.num_actions(), action_mask.len())?;
         let mut scratch = self.heads_scratch.borrow_mut();
         let (mut value, state_hash) =
             self.predict_value_and_state_hash(env, max_placements, &mut scratch)?;
-        let mut policy_logits = self.heads.all_policy_logits(&scratch);
+        let mut policy_logits = self.weights.heads.all_policy_logits(&scratch);
         apply_prediction_noise(&mut policy_logits, &mut value, prediction_noise, state_hash)?;
 
         let policy = masked_softmax(&policy_logits, action_mask);
@@ -308,13 +345,13 @@ impl TetrisNN {
         max_placements: usize,
         prediction_noise: PredictionNoiseSettings,
     ) -> TractResult<(Vec<f32>, f32)> {
-        self.validate_valid_actions(self.heads.num_actions(), valid_actions)?;
+        self.validate_valid_actions(self.weights.heads.num_actions(), valid_actions)?;
         let mut scratch = self.heads_scratch.borrow_mut();
         let (mut value, state_hash) =
             self.predict_value_and_state_hash(env, max_placements, &mut scratch)?;
         if prediction_noise.is_enabled() {
             // Noise is drawn for every logit in action order, so it needs the full vector.
-            let mut policy_logits = self.heads.all_policy_logits(&scratch);
+            let mut policy_logits = self.weights.heads.all_policy_logits(&scratch);
             apply_prediction_noise(&mut policy_logits, &mut value, prediction_noise, state_hash)?;
             return Ok((
                 softmax_over_valid_actions(&policy_logits, valid_actions),
@@ -323,7 +360,8 @@ impl TetrisNN {
         }
 
         let mut priors = vec![0.0; valid_actions.len()];
-        self.heads
+        self.weights
+            .heads
             .policy_logits(&scratch, valid_actions, &mut priors);
         softmax_in_place(&mut priors);
         Ok((priors, value))
@@ -339,14 +377,15 @@ impl TetrisNN {
         // No caching for raw tensor inputs (used only by debug functions).
         // aux_tensor is the full 80-dim vector; split into piece_aux (61) + board_stats (19).
         let (piece_aux, board_stats) = self.split_aux_tensor(aux_tensor)?;
-        self.validate_policy_output_len(self.heads.num_actions(), action_mask.len())?;
+        self.validate_policy_output_len(self.weights.heads.num_actions(), action_mask.len())?;
         let mut scratch = self.heads_scratch.borrow_mut();
-        let mut board_input = vec![0.0; self.heads.board_fusion_width()];
+        let mut board_input = vec![0.0; self.weights.heads.board_fusion_width()];
         self.compute_board_fusion_input(board_tensor, board_stats, &mut scratch, &mut board_input)?;
         let mut value = self
+            .weights
             .heads
             .forward_trunk(&board_input, piece_aux, &mut scratch);
-        let mut policy_logits = self.heads.all_policy_logits(&scratch);
+        let mut policy_logits = self.weights.heads.all_policy_logits(&scratch);
         let state_hash = hash_prediction_inputs_for_tensors(board_tensor, piece_aux);
         apply_prediction_noise(&mut policy_logits, &mut value, prediction_noise, state_hash)?;
 
@@ -375,20 +414,11 @@ impl TetrisNN {
 impl Clone for TetrisNN {
     fn clone(&self) -> Self {
         // Share the immutable weights; create fresh scratch, cache and counters.
-        TetrisNN {
-            board_embedder: Arc::clone(&self.board_embedder),
-            board_scratch: RefCell::new(self.board_embedder.new_scratch()),
-            heads: Arc::clone(&self.heads),
-            board_cache: RefCell::new(BoardCache::new(
-                self.heads.board_fusion_width(),
-                self.cache_capacity,
-            )),
-            heads_scratch: RefCell::new(self.heads.new_scratch()),
-            cache_capacity: self.cache_capacity,
-            cache_hits: Cell::new(0),
-            cache_misses: Cell::new(0),
-            cache_enabled: Cell::new(self.cache_enabled.get()),
-        }
+        Self::from_weights(
+            Arc::clone(&self.weights),
+            self.cache_capacity,
+            self.cache_enabled.get(),
+        )
     }
 }
 
