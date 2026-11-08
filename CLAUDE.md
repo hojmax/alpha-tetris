@@ -186,7 +186,7 @@ Disk note:
 
 1. Edit `tetris_bot/ml/network.py`.
 2. Update Rust inference encoding in `tetris_core/src/inference/mod.rs` if feature schema changes.
-3. The board-embedding path (conv trunk + `fc.bin` MLP) runs natively in Rust: `tetris_core/src/inference/conv.rs` reads weights from `X.conv.onnx` and strictly pattern-matches the exported `ConvBackbone` graph, so any change to `ConvBackbone`/`ResidualConvBlock`/GroupNorm/SiLU structure must be mirrored there (loading fails loudly otherwise). Only the heads model still goes through tract/ORT.
+3. The whole network runs natively in Rust (no tract/ORT at inference time). `tetris_core/src/inference/conv.rs` reads the conv trunk from `X.conv.onnx` and strictly pattern-matches the exported `ConvBackbone` graph; `tetris_core/src/inference/heads.rs` reads `X.heads.onnx` initializers by PyTorch parameter name. Any change to `ConvBackbone`/`ResidualConvBlock`/GroupNorm/SiLU structure or to the heads (aux MLP, board/aux concatenation + `fusion_fc`, residual fusion blocks, policy/value heads) must be mirrored there; loading fails loudly on any unexpected graph structure.
 4. Retrain/export ONNX artifacts.
 
 ### Train / Resume
@@ -218,7 +218,7 @@ make optimize
 ```
 
 Set `MODEL_PROFILE=<existing-onnx-path>` when the Makefile default model path is missing.
-Set `TETRIS_NN_BACKEND=ort` to profile ONNX Runtime instead of default `tract`.
+Inference no longer goes through tract/ORT: the conv trunk, board MLP and heads all run natively, so `TETRIS_NN_BACKEND` is not read and the `nn-ort` feature / `make build-ort` no longer change inference (cleanup pending).
 `make optimize` is fast by default; for an exhaustive sweep: `make optimize OPT_BACKEND_STRATEGY=exhaustive OPT_WORKER_SEARCH=grid OPT_GAMES=40 OPT_SIMS=500`.
 Results written to `benchmarks/profiles/optimize_cache/<machine_fingerprint>.env`; `make train` computes the current machine fingerprint and loads the matching env (runs optimize first if missing).
 Do NOT use `maturin develop` — use `maturin build --out tetris_core/dist` then `$(PYTHON) -m pip install` (respects `.venv` `sys.prefix` correctly).

@@ -1,24 +1,19 @@
 //! Neural Network Inference
 //!
-//! Loads split models: the conv backbone (`X.conv.onnx`) and cached-board-path MLP (`X.fc.bin`)
-//! run natively (`board_embedding`), the heads (`X.heads.onnx`) run through the selected backend.
-//! Caches board embeddings to skip recomputing the board-only path on repeated board states.
+//! Loads split models and runs them natively: the conv backbone (`X.conv.onnx`) and the
+//! cached-board-path MLP (`X.fc.bin`) via `board_embedding`, the heads (`X.heads.onnx`) via
+//! `heads`. The board-only part of the network, up to and including the board columns of
+//! `fusion_fc`, is cached per board.
 
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, VecDeque};
-use std::env;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
-#[cfg(feature = "nn-ort")]
-use std::sync::Mutex;
 
 use ndarray::{Array1, Array2};
-#[cfg(feature = "nn-ort")]
-use ort::{inputs, session::Session, value::TensorRef};
 use rand::rngs::StdRng;
 use rand::{thread_rng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
@@ -38,43 +33,33 @@ use crate::search::{
     normalize_overhang_fields, normalize_row_fill_counts, normalize_total_blocks,
 };
 
+mod board_cache;
 mod board_embedding;
 mod conv;
+mod heads;
+mod heads_kernels;
+mod heads_onnx;
 mod kernels;
 mod onnx_proto;
 #[cfg(test)]
 mod tests;
 
+use board_cache::{BoardCache, BoardKey};
 use board_embedding::{BoardEmbedder, BoardEmbeddingScratch};
+use heads::{HeadsModel, HeadsScratch};
 
 /// Neural network model wrapper with board embedding cache
 pub struct TetrisNN {
-    backend: InferenceBackend,
     board_embedder: Arc<BoardEmbedder>,
     board_scratch: RefCell<BoardEmbeddingScratch>,
-    board_hidden: usize,
-    board_cache: RefCell<HashMap<[u64; 4], Array1<f32>>>,
-    cache_order: RefCell<VecDeque<[u64; 4]>>,
+    heads: Arc<HeadsModel>,
+    /// Packed board -> board-only fusion input (`HeadsModel::board_fusion_input`).
+    board_cache: RefCell<BoardCache>,
+    heads_scratch: RefCell<HeadsScratch>,
     cache_capacity: usize,
     cache_hits: Cell<u64>,
     cache_misses: Cell<u64>,
     cache_enabled: Cell<bool>,
-}
-
-#[derive(Clone)]
-enum InferenceBackend {
-    Tract {
-        heads_model: Arc<TypedRunnableModel<TypedModel>>,
-    },
-    #[cfg(feature = "nn-ort")]
-    Ort { heads_session: Arc<Mutex<Session>> },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RuntimeBackend {
-    Tract,
-    #[cfg(feature = "nn-ort")]
-    Ort,
 }
 
 #[derive(Clone)]
@@ -117,222 +102,34 @@ struct CachedBoardPath {
 }
 
 impl TetrisNN {
-    fn selected_backend_from_env() -> TractResult<RuntimeBackend> {
-        match env::var("TETRIS_NN_BACKEND") {
-            Ok(raw) => {
-                let backend = raw.trim().to_ascii_lowercase();
-                match backend.as_str() {
-                    "" | "tract" => Ok(RuntimeBackend::Tract),
-                    "ort" | "onnxruntime" | "onnx-runtime" => {
-                        #[cfg(feature = "nn-ort")]
-                        {
-                            Ok(RuntimeBackend::Ort)
-                        }
-                        #[cfg(not(feature = "nn-ort"))]
-                        {
-                            Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                "TETRIS_NN_BACKEND=ort requested, but tetris_core was built without feature `nn-ort`",
-                            )
-                            .into())
-                        }
-                    }
-                    _ => Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "Unsupported TETRIS_NN_BACKEND='{}' (expected 'tract' or 'ort')",
-                            raw
-                        ),
-                    )
-                    .into()),
-                }
-            }
-            Err(env::VarError::NotPresent) => Ok(RuntimeBackend::Tract),
-            Err(err) => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Failed to read TETRIS_NN_BACKEND: {err}"),
-            )
-            .into()),
-        }
-    }
-
-    fn load_tract_backend(heads_path: &Path) -> TractResult<InferenceBackend> {
-        let heads_model = tract_onnx::onnx()
-            .model_for_path(heads_path)?
-            .into_optimized()?
-            .into_runnable()?;
-
-        Ok(InferenceBackend::Tract {
-            heads_model: Arc::new(heads_model),
-        })
-    }
-
-    #[cfg(feature = "nn-ort")]
-    fn load_ort_backend(heads_path: &Path) -> TractResult<InferenceBackend> {
-        let heads_session = Session::builder()
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Failed to build ONNX Runtime heads session builder: {e}"),
-                )
-            })?
-            .commit_from_file(heads_path)
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "Failed to load ONNX Runtime heads model '{}': {e}",
-                        heads_path.display()
-                    ),
-                )
-            })?;
-
-        Ok(InferenceBackend::Ort {
-            heads_session: Arc::new(Mutex::new(heads_session)),
-        })
-    }
-
-    fn load_inference_backend(heads_path: &Path) -> TractResult<InferenceBackend> {
-        match Self::selected_backend_from_env()? {
-            RuntimeBackend::Tract => Self::load_tract_backend(heads_path),
-            #[cfg(feature = "nn-ort")]
-            RuntimeBackend::Ort => Self::load_ort_backend(heads_path),
-        }
-    }
-
     /// Load split models from file.
     /// Given a base path like "latest.onnx", loads:
     /// - "latest.conv.onnx" (conv backbone weights, run natively)
-    /// - "latest.heads.onnx" (post-cache fusion + heads)
+    /// - "latest.heads.onnx" (post-cache fusion + heads, run natively)
     /// - "latest.fc.bin" (cached-board-path weights)
     pub fn load<P: AsRef<Path>>(path: P) -> TractResult<Self> {
         let base = path.as_ref().with_extension("");
         let conv_path = base.with_extension("conv.onnx");
         let heads_path = base.with_extension("heads.onnx");
         let fc_path = base.with_extension("fc.bin");
-        let backend = Self::load_inference_backend(&heads_path)?;
 
         let board_embedder = BoardEmbedder::load(&conv_path, &load_fc_binary(&fc_path)?)?;
-        let board_scratch = RefCell::new(board_embedder.new_scratch());
-        let board_hidden = board_embedder.output_size();
+        let heads = HeadsModel::load(&heads_path, board_embedder.output_size())?;
 
         Ok(TetrisNN {
-            backend,
+            board_scratch: RefCell::new(board_embedder.new_scratch()),
             board_embedder: Arc::new(board_embedder),
-            board_scratch,
-            board_hidden,
-            board_cache: RefCell::new(HashMap::new()),
-            cache_order: RefCell::new(VecDeque::new()),
+            board_cache: RefCell::new(BoardCache::new(
+                heads.board_fusion_width(),
+                BOARD_CACHE_MAX_ENTRIES,
+            )),
+            heads_scratch: RefCell::new(heads.new_scratch()),
+            heads: Arc::new(heads),
             cache_capacity: BOARD_CACHE_MAX_ENTRIES,
             cache_hits: Cell::new(0),
             cache_misses: Cell::new(0),
             cache_enabled: Cell::new(true),
         })
-    }
-
-    fn run_heads(&self, board_embed: &[f32], piece_aux: &[f32]) -> TractResult<(Vec<f32>, f32)> {
-        match &self.backend {
-            InferenceBackend::Tract { heads_model, .. } => {
-                let board_h_tensor = tract_ndarray::Array2::from_shape_vec(
-                    (1, self.board_hidden),
-                    board_embed.to_vec(),
-                )?
-                .into_tensor();
-                let aux_tensor = tract_ndarray::Array2::from_shape_vec(
-                    (1, PIECE_AUX_FEATURES),
-                    piece_aux.to_vec(),
-                )?
-                .into_tensor();
-                let heads_output =
-                    heads_model.run(tvec!(board_h_tensor.into(), aux_tensor.into()))?;
-
-                let policy_logits: Vec<f32> = heads_output[0]
-                    .to_array_view::<f32>()?
-                    .iter()
-                    .copied()
-                    .collect();
-                let value = heads_output[1]
-                    .to_array_view::<f32>()?
-                    .iter()
-                    .next()
-                    .copied()
-                    .expect("NN value output tensor is empty - model is malformed");
-                Ok((policy_logits, value))
-            }
-            #[cfg(feature = "nn-ort")]
-            InferenceBackend::Ort { heads_session, .. } => {
-                let board_h_tensor =
-                    TensorRef::from_array_view(([1usize, self.board_hidden], board_embed))
-                        .map_err(|e| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!("Failed to build ORT board embedding tensor: {e}"),
-                            )
-                        })?;
-                let aux_tensor =
-                    TensorRef::from_array_view(([1usize, PIECE_AUX_FEATURES], piece_aux)).map_err(
-                        |e| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!("Failed to build ORT aux tensor: {e}"),
-                            )
-                        },
-                    )?;
-
-                let mut session = heads_session.lock().map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("ONNX Runtime heads session lock poisoned: {e}"),
-                    )
-                })?;
-                let outputs = session
-                    .run(inputs![board_h_tensor, aux_tensor])
-                    .map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("ONNX Runtime heads inference failed: {e}"),
-                        )
-                    })?;
-
-                let (_policy_shape, policy_logits) =
-                    outputs[0].try_extract_tensor::<f32>().map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("Failed to extract ORT policy logits tensor: {e}"),
-                        )
-                    })?;
-                let policy_logits = policy_logits.to_vec();
-
-                let (_value_shape, value_slice) =
-                    outputs[1].try_extract_tensor::<f32>().map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("Failed to extract ORT value tensor: {e}"),
-                        )
-                    })?;
-                let value = value_slice.first().copied().ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "NN value output tensor is empty - model is malformed",
-                    )
-                })?;
-                Ok((policy_logits, value))
-            }
-        }
-    }
-
-    fn run_heads_for_embedding(
-        &self,
-        board_embed: &Array1<f32>,
-        piece_aux: &[f32],
-    ) -> TractResult<(Vec<f32>, f32)> {
-        let board_embed = board_embed.as_slice_memory_order().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Board embedding array is not contiguous",
-            )
-        })?;
-        self.run_heads(board_embed, piece_aux)
     }
 
     fn compute_board_embedding(
@@ -347,69 +144,82 @@ impl TetrisNN {
         Ok(Array1::from(board_h.to_vec()))
     }
 
-    fn insert_board_embedding_cache(&self, board_key: [u64; 4], embed: Array1<f32>) {
-        let mut cache = self.board_cache.borrow_mut();
-        let mut cache_order = self.cache_order.borrow_mut();
-
-        if cache.insert(board_key, embed).is_none() {
-            cache_order.push_back(board_key);
-        }
-
-        while cache.len() > self.cache_capacity {
-            let Some(oldest_key) = cache_order.pop_front() else {
-                break;
-            };
-            cache.remove(&oldest_key);
-        }
-    }
-
     fn clear_board_embedding_cache(&self) {
         self.board_cache.borrow_mut().clear();
-        self.cache_order.borrow_mut().clear();
     }
 
-    fn get_or_compute_board_embedding(&self, env: &TetrisEnv) -> TractResult<Array1<f32>> {
-        let board_embed = if self.cache_enabled.get() {
-            let board_key = pack_board(env);
-            let board_embed = {
-                let cache = self.board_cache.borrow();
-                cache.get(&board_key).cloned()
-            };
+    /// Board-only fusion input for one board: board embedding, then the board columns of
+    /// `fusion_fc` plus its bias.
+    fn compute_board_fusion_input(
+        &self,
+        board_f32: &[f32],
+        board_stats: &[f32],
+        scratch: &mut HeadsScratch,
+        out: &mut [f32],
+    ) -> TractResult<()> {
+        let board_embed = self.compute_board_embedding(board_f32, board_stats)?;
+        self.heads
+            .board_fusion_input(contiguous_board_embedding(&board_embed)?, scratch, out);
+        Ok(())
+    }
 
-            match board_embed {
-                Some(embed) => {
-                    self.cache_hits.set(self.cache_hits.get() + 1);
-                    embed
-                }
-                None => {
-                    self.cache_misses.set(self.cache_misses.get() + 1);
-                    let board_f32 = encode_board_features(env);
-                    let board_stats = encode_board_stats(env);
-                    let embed = self.compute_board_embedding(&board_f32, &board_stats)?;
-                    self.insert_board_embedding_cache(board_key, embed.clone());
-                    embed
-                }
+    /// Run the heads up to the policy hidden layer for `env`, taking the board-only fusion
+    /// input from the cache. Returns the value; the policy hidden activations stay in
+    /// `scratch` for the policy logits.
+    fn run_heads_trunk(
+        &self,
+        env: &TetrisEnv,
+        piece_aux: &[f32],
+        scratch: &mut HeadsScratch,
+    ) -> TractResult<f32> {
+        if !self.cache_enabled.get() {
+            let mut board_input = vec![0.0; self.heads.board_fusion_width()];
+            self.compute_board_fusion_input(
+                &encode_board_features(env),
+                &encode_board_stats(env),
+                scratch,
+                &mut board_input,
+            )?;
+            return Ok(self.heads.forward_trunk(&board_input, piece_aux, scratch));
+        }
+
+        let board_key = BoardKey(pack_board(env));
+        let mut cache = self.board_cache.borrow_mut();
+        let slot = match cache.slot_of(&board_key) {
+            Some(slot) => {
+                self.cache_hits.set(self.cache_hits.get() + 1);
+                slot
             }
-        } else {
-            let board_f32 = encode_board_features(env);
-            let board_stats = encode_board_stats(env);
-            self.compute_board_embedding(&board_f32, &board_stats)?
+            None => {
+                self.cache_misses.set(self.cache_misses.get() + 1);
+                let board_embed = self.compute_board_embedding(
+                    &encode_board_features(env),
+                    &encode_board_stats(env),
+                )?;
+                let board_embed = contiguous_board_embedding(&board_embed)?;
+                let (slot, row) = cache.insert(board_key);
+                self.heads.board_fusion_input(board_embed, scratch, row);
+                slot
+            }
         };
-        Ok(board_embed)
+        Ok(self
+            .heads
+            .forward_trunk(cache.row(slot), piece_aux, scratch))
     }
 
-    fn predict_policy_logits_and_value(
+    /// Encode the piece/game aux features, run the heads trunk and return the value plus the
+    /// prediction-noise state hash.
+    fn predict_value_and_state_hash(
         &self,
         env: &TetrisEnv,
         max_placements: usize,
-    ) -> TractResult<(Vec<f32>, f32, u64)> {
-        let board_embed = self.get_or_compute_board_embedding(env)?;
-
+        scratch: &mut HeadsScratch,
+    ) -> TractResult<(f32, u64)> {
         // Encode only piece/game aux features (61-dim) for the heads model.
         let piece_aux_vec = encode_piece_aux_features(env, max_placements)?;
         let state_hash = hash_prediction_inputs(&pack_board(env), &piece_aux_vec);
-        let (policy_logits, value) = self.run_heads_for_embedding(&board_embed, &piece_aux_vec)?;
-        Ok((policy_logits, value, state_hash))
+        let value = self.run_heads_trunk(env, &piece_aux_vec, scratch)?;
+        Ok((value, state_hash))
     }
 
     fn validate_policy_output_len(
@@ -477,9 +287,11 @@ impl TetrisNN {
         max_placements: usize,
         prediction_noise: PredictionNoiseSettings,
     ) -> TractResult<(Vec<f32>, f32)> {
-        let (mut policy_logits, mut value, state_hash) =
-            self.predict_policy_logits_and_value(env, max_placements)?;
-        self.validate_policy_output_len(policy_logits.len(), action_mask.len())?;
+        self.validate_policy_output_len(self.heads.num_actions(), action_mask.len())?;
+        let mut scratch = self.heads_scratch.borrow_mut();
+        let (mut value, state_hash) =
+            self.predict_value_and_state_hash(env, max_placements, &mut scratch)?;
+        let mut policy_logits = self.heads.all_policy_logits(&scratch);
         apply_prediction_noise(&mut policy_logits, &mut value, prediction_noise, state_hash)?;
 
         let policy = masked_softmax(&policy_logits, action_mask);
@@ -487,6 +299,8 @@ impl TetrisNN {
     }
 
     /// Run inference with precomputed valid action indices.
+    ///
+    /// Without prediction noise only the policy logits of `valid_actions` are computed.
     pub fn predict_with_valid_actions(
         &self,
         env: &TetrisEnv,
@@ -494,14 +308,25 @@ impl TetrisNN {
         max_placements: usize,
         prediction_noise: PredictionNoiseSettings,
     ) -> TractResult<(Vec<f32>, f32)> {
-        let (mut policy_logits, mut value, state_hash) =
-            self.predict_policy_logits_and_value(env, max_placements)?;
-        self.validate_valid_actions(policy_logits.len(), valid_actions)?;
-        apply_prediction_noise(&mut policy_logits, &mut value, prediction_noise, state_hash)?;
-        Ok((
-            softmax_over_valid_actions(&policy_logits, valid_actions),
-            value,
-        ))
+        self.validate_valid_actions(self.heads.num_actions(), valid_actions)?;
+        let mut scratch = self.heads_scratch.borrow_mut();
+        let (mut value, state_hash) =
+            self.predict_value_and_state_hash(env, max_placements, &mut scratch)?;
+        if prediction_noise.is_enabled() {
+            // Noise is drawn for every logit in action order, so it needs the full vector.
+            let mut policy_logits = self.heads.all_policy_logits(&scratch);
+            apply_prediction_noise(&mut policy_logits, &mut value, prediction_noise, state_hash)?;
+            return Ok((
+                softmax_over_valid_actions(&policy_logits, valid_actions),
+                value,
+            ));
+        }
+
+        let mut priors = vec![0.0; valid_actions.len()];
+        self.heads
+            .policy_logits(&scratch, valid_actions, &mut priors);
+        softmax_in_place(&mut priors);
+        Ok((priors, value))
     }
 
     pub fn predict_masked_from_tensors(
@@ -514,11 +339,15 @@ impl TetrisNN {
         // No caching for raw tensor inputs (used only by debug functions).
         // aux_tensor is the full 80-dim vector; split into piece_aux (61) + board_stats (19).
         let (piece_aux, board_stats) = self.split_aux_tensor(aux_tensor)?;
-        let board_embed = self.compute_board_embedding(board_tensor, board_stats)?;
-        let (mut policy_logits, mut value) =
-            self.run_heads_for_embedding(&board_embed, piece_aux)?;
+        self.validate_policy_output_len(self.heads.num_actions(), action_mask.len())?;
+        let mut scratch = self.heads_scratch.borrow_mut();
+        let mut board_input = vec![0.0; self.heads.board_fusion_width()];
+        self.compute_board_fusion_input(board_tensor, board_stats, &mut scratch, &mut board_input)?;
+        let mut value = self
+            .heads
+            .forward_trunk(&board_input, piece_aux, &mut scratch);
+        let mut policy_logits = self.heads.all_policy_logits(&scratch);
         let state_hash = hash_prediction_inputs_for_tensors(board_tensor, piece_aux);
-        self.validate_policy_output_len(policy_logits.len(), action_mask.len())?;
         apply_prediction_noise(&mut policy_logits, &mut value, prediction_noise, state_hash)?;
 
         let policy = masked_softmax(&policy_logits, action_mask);
@@ -545,20 +374,31 @@ impl TetrisNN {
 
 impl Clone for TetrisNN {
     fn clone(&self) -> Self {
-        // Share backend sessions/models and weights, create fresh scratch, cache and counters.
+        // Share the immutable weights; create fresh scratch, cache and counters.
         TetrisNN {
-            backend: self.backend.clone(),
             board_embedder: Arc::clone(&self.board_embedder),
             board_scratch: RefCell::new(self.board_embedder.new_scratch()),
-            board_hidden: self.board_hidden,
-            board_cache: RefCell::new(HashMap::new()),
-            cache_order: RefCell::new(VecDeque::new()),
+            heads: Arc::clone(&self.heads),
+            board_cache: RefCell::new(BoardCache::new(
+                self.heads.board_fusion_width(),
+                self.cache_capacity,
+            )),
+            heads_scratch: RefCell::new(self.heads.new_scratch()),
             cache_capacity: self.cache_capacity,
             cache_hits: Cell::new(0),
             cache_misses: Cell::new(0),
             cache_enabled: Cell::new(self.cache_enabled.get()),
         }
     }
+}
+
+fn contiguous_board_embedding(board_embed: &Array1<f32>) -> TractResult<&[f32]> {
+    Ok(board_embed.as_slice_memory_order().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Board embedding array is not contiguous",
+        )
+    })?)
 }
 
 /// Pack 200 binary board cells into [u64; 4] for use as a hash key.
@@ -1297,30 +1137,34 @@ pub fn masked_softmax(logits: &[f32], mask: &[bool]) -> Vec<f32> {
 ///
 /// Returns priors aligned with `valid_actions` order.
 pub fn softmax_over_valid_actions(logits: &[f32], valid_actions: &[usize]) -> Vec<f32> {
-    let mut result = vec![0.0; valid_actions.len()];
-    if valid_actions.is_empty() {
-        return result;
+    let mut result: Vec<f32> = valid_actions
+        .iter()
+        .map(|&action_idx| logits[action_idx])
+        .collect();
+    softmax_in_place(&mut result);
+    result
+}
+
+/// In-place softmax over a compact logit vector; matches `masked_softmax` restricted to the
+/// same entries in the same order.
+fn softmax_in_place(values: &mut [f32]) {
+    if values.is_empty() {
+        return;
     }
 
-    let mut max_logit = f32::NEG_INFINITY;
-    for &action_idx in valid_actions {
-        max_logit = max_logit.max(logits[action_idx]);
-    }
-
+    let max_logit = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0;
-    for (i, &action_idx) in valid_actions.iter().enumerate() {
-        let exp_val = (logits[action_idx] - max_logit).exp();
-        result[i] = exp_val;
+    for value in values.iter_mut() {
+        let exp_val = (*value - max_logit).exp();
+        *value = exp_val;
         sum += exp_val;
     }
 
     if sum > 0.0 {
-        for prior in &mut result {
-            *prior /= sum;
+        for value in values.iter_mut() {
+            *value /= sum;
         }
     }
-
-    result
 }
 
 /// Get action mask from environment
