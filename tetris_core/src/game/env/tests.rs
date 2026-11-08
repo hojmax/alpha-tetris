@@ -837,6 +837,52 @@ mod tests {
     }
 
     #[test]
+    fn test_tspin_mini_double_attack() {
+        let mut env = TetrisEnv::new(10, 20);
+        // Vertical T (rotation 1, pointing right) against the left wall, center at (0, 18).
+        // Back corners are the wall, the bottom-right front corner is filled and the
+        // top-right front corner is open, so this is a mini that clears rows 18 and 19.
+        // The overhang matters: a T that could move up is not counted as a T-spin.
+        let rows = [
+            "..........",
+            "..........",
+            "..........",
+            "..........",
+            "..........",
+            "..........",
+            "..........",
+            "..........",
+            "..........",
+            "..........",
+            "..........",
+            "..........",
+            "..........",
+            "..........",
+            "..........",
+            "..........",
+            "X.........", // overhang so the piece cannot move up
+            "..........",
+            "..XXXXXXXX",
+            ".XXXXXXXXX",
+        ];
+        set_board_from_ascii(&mut env, &rows);
+        env.spawn_piece_from_type(T_PIECE);
+
+        let attack_delta = env.place_piece_internal_with_kick(-1, 17, 1, true, 0);
+
+        assert_eq!(env.lines_cleared, 2);
+        let result = env
+            .last_attack_result
+            .as_ref()
+            .expect("T-spin mini double should produce an attack result");
+        assert!(result.is_tspin);
+        assert!(result.is_mini_tspin);
+        assert_eq!(result.base_attack, 1);
+        assert_eq!(attack_delta, 1);
+        assert!(result.back_to_back_active);
+    }
+
+    #[test]
     fn test_handcrafted_board_has_mcts_placement_for_tspin_double_attack() {
         let env = setup_handcrafted_tspin_env();
         let placements = env.get_possible_placements();

@@ -24,6 +24,8 @@ pub enum ClearType {
     Tetris,
     /// T-spin mini single (1 line with mini T-spin)
     TSpinMiniSingle,
+    /// T-spin mini double (2 lines with mini T-spin)
+    TSpinMiniDouble,
     /// T-spin single (1 line with T-spin)
     TSpinSingle,
     /// T-spin double (2 lines with T-spin)
@@ -39,6 +41,7 @@ impl ClearType {
             self,
             ClearType::Tetris
                 | ClearType::TSpinMiniSingle
+                | ClearType::TSpinMiniDouble
                 | ClearType::TSpinSingle
                 | ClearType::TSpinDouble
                 | ClearType::TSpinTriple
@@ -54,6 +57,7 @@ impl ClearType {
             ClearType::Triple => 2,
             ClearType::Tetris => 4,
             ClearType::TSpinMiniSingle => 0,
+            ClearType::TSpinMiniDouble => 1,
             ClearType::TSpinSingle => 2,
             ClearType::TSpinDouble => 4,
             ClearType::TSpinTriple => 6,
@@ -214,7 +218,8 @@ pub fn determine_clear_type(lines_cleared: u32, is_tspin: bool, is_mini_tspin: b
         (1, true, true) => ClearType::TSpinMiniSingle,
         (1, true, false) => ClearType::TSpinSingle,
         (2, false, _) => ClearType::Double,
-        (2, true, _) => ClearType::TSpinDouble,
+        (2, true, true) => ClearType::TSpinMiniDouble,
+        (2, true, false) => ClearType::TSpinDouble,
         (3, false, _) => ClearType::Triple,
         (3, true, _) => ClearType::TSpinTriple,
         (4, _, _) => ClearType::Tetris,
@@ -234,6 +239,7 @@ mod tests {
         assert_eq!(ClearType::Triple.base_attack(), 2);
         assert_eq!(ClearType::Tetris.base_attack(), 4);
         assert_eq!(ClearType::TSpinMiniSingle.base_attack(), 0);
+        assert_eq!(ClearType::TSpinMiniDouble.base_attack(), 1);
         assert_eq!(ClearType::TSpinSingle.base_attack(), 2);
         assert_eq!(ClearType::TSpinDouble.base_attack(), 4);
         assert_eq!(ClearType::TSpinTriple.base_attack(), 6);
@@ -247,6 +253,7 @@ mod tests {
         assert!(!ClearType::Triple.is_difficult());
         assert!(ClearType::Tetris.is_difficult());
         assert!(ClearType::TSpinMiniSingle.is_difficult());
+        assert!(ClearType::TSpinMiniDouble.is_difficult());
         assert!(ClearType::TSpinSingle.is_difficult());
         assert!(ClearType::TSpinDouble.is_difficult());
         assert!(ClearType::TSpinTriple.is_difficult());
@@ -286,6 +293,10 @@ mod tests {
         );
         assert_eq!(determine_clear_type(1, true, false), ClearType::TSpinSingle);
         assert_eq!(determine_clear_type(2, true, false), ClearType::TSpinDouble);
+        assert_eq!(
+            determine_clear_type(2, true, true),
+            ClearType::TSpinMiniDouble
+        );
         assert_eq!(determine_clear_type(3, true, false), ClearType::TSpinTriple);
     }
 

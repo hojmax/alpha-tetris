@@ -149,6 +149,7 @@ Ownership split:
 
 - Attack baseline: single 0, double 1, triple 2, tetris 4.
 - T-spins, combo, back-to-back, perfect clear apply bonuses.
+- T-spin base attack: mini single 0, mini double 1, single 2, double 4, triple 6 (TETR.IO values). Minis count as difficult for back-to-back. Detection (`game/env/clearing.rs`) uses the 3-corner rule plus front corners, upgrades a 5th-kick rotation to full, and also rejects any T that could still move up (a non-guideline extra that only drops some vertical minis).
 
 ## Important Defaults (TrainingConfig)
 
