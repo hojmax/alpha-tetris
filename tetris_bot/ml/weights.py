@@ -149,17 +149,17 @@ class CheckpointSaveRequest:
     export_for_rust: bool
 
 
-def _clone_state_value_to_cpu(value: Any) -> Any:
+def clone_state_value_to_cpu(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
         return value.detach().to(device="cpu", copy=True)
     if isinstance(value, dict):
         return type(value)(
-            (key, _clone_state_value_to_cpu(item)) for key, item in value.items()
+            (key, clone_state_value_to_cpu(item)) for key, item in value.items()
         )
     if isinstance(value, list):
-        return [_clone_state_value_to_cpu(item) for item in value]
+        return [clone_state_value_to_cpu(item) for item in value]
     if isinstance(value, tuple):
-        return tuple(_clone_state_value_to_cpu(item) for item in value)
+        return tuple(clone_state_value_to_cpu(item) for item in value)
     return value
 
 
@@ -173,19 +173,19 @@ def capture_checkpoint_snapshot(
 ) -> CheckpointSnapshot:
     return CheckpointSnapshot(
         step=step,
-        model_state_dict=_clone_state_value_to_cpu(model.state_dict()),
+        model_state_dict=clone_state_value_to_cpu(model.state_dict()),
         ema_state_dict=(
-            _clone_state_value_to_cpu(ema_model.state_dict())
+            clone_state_value_to_cpu(ema_model.state_dict())
             if ema_model is not None
             else None
         ),
         optimizer_state_dict=(
-            _clone_state_value_to_cpu(optimizer.state_dict())
+            clone_state_value_to_cpu(optimizer.state_dict())
             if optimizer is not None
             else None
         ),
         scheduler_state_dict=(
-            _clone_state_value_to_cpu(scheduler.state_dict())
+            clone_state_value_to_cpu(scheduler.state_dict())
             if scheduler is not None
             else None
         ),

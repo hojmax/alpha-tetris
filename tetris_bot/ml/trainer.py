@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 import math
@@ -20,7 +21,6 @@ import wandb
 from tetris_bot.constants import (
     BOARD_HEIGHT,
     BOARD_WIDTH,
-    DEFAULT_GIF_FRAME_DURATION_MS,
     INCUMBENT_ONNX_FILENAME,
     LATEST_ONNX_FILENAME,
     MODEL_CANDIDATES_DIRNAME,
@@ -46,18 +46,22 @@ from tetris_bot.ml.weights import (
     AsyncCheckpointSaver,
     WeightManager,
     capture_checkpoint_snapshot,
-    export_onnx,
-    export_split_models,
     sanitize_optimizer_state_steps,
     split_model_paths,
 )
 from tetris_bot.ml.loss import RunningLossBalancer, compute_loss, compute_metrics
-from tetris_bot.visualization import create_trajectory_gif, render_replay
 from tetris_bot.ml.artifacts import (
     assert_rust_inference_artifacts,
     copy_model_artifact_bundle,
+    export_rust_inference_bundle,
     optional_model_artifact_paths,
+    required_model_artifact_paths,
 )
+from tetris_bot.ml.background_process import (
+    CompletedExport,
+    TrainerBackgroundProcess,
+)
+from tetris_bot.visualization import ReplayLike
 from tetris_bot.ml.replay_buffer import TrainingBatch, CircularReplayMirror
 from tetris_bot.ml.game_metrics import (
     average_completed_games,
@@ -75,7 +79,7 @@ from tetris_bot.ml.r2_sync import (
     upload_self_play_snapshot,
 )
 
-from tetris_core.tetris_core import GameGenerator, GameReplay, MCTSConfig
+from tetris_core.tetris_core import GameGenerator, MCTSConfig
 from tetris_core.tetris_core import evaluate_model
 
 logger = structlog.get_logger()
@@ -242,6 +246,9 @@ class Trainer:
         self._cached_value_loss_weight: float = 1.0
         self._pending_eval_gif_paths: list[Path] = []
         self._async_checkpoint_saver: AsyncCheckpointSaver | None = None
+        # Model export and GIF rendering run here so model syncs do not stall
+        # train steps; created in `train()`.
+        self._background_process: TrainerBackgroundProcess | None = None
         self.initial_incumbent_model_path: Path | None = None
         self.initial_incumbent_eval_avg_attack: float = 0.0
         self.initial_candidate_gate_interval_seconds: float | None = None
@@ -286,6 +293,11 @@ class Trainer:
         self._r2_chunk_downloader: ChunkDownloader | None = None
         self._r2_game_stats_downloader: GameStatsDownloader | None = None
         self._r2_last_uploaded_step: int = -1
+        # Serializes uploads: direct-sync bundles upload on a worker thread
+        # while checkpoints upload the incumbent from the training thread.
+        self._r2_upload_lock = threading.Lock()
+        self._r2_upload_executor: ThreadPoolExecutor | None = None
+        self._r2_upload_future: Future[None] | None = None
         self._remote_completed_games_lock = threading.Lock()
         self._remote_completed_games: deque[CompletedGameLogEntry] = deque()
         # Per-machine completed-game counts feeding the
@@ -490,42 +502,34 @@ class Trainer:
             min_completed_time_s,
         )
 
-    def _build_direct_sync_recent_game_wandb_data(
+    def _select_direct_sync_recent_game(
         self,
         recent_completed_replays: deque[CompletedGameLogEntry],
         *,
         now_s: float,
         window_s: float,
-    ) -> dict[str, object]:
+    ) -> tuple[dict[str, object], dict[str, tuple[ReplayLike, Path]]] | None:
+        """Pick a random replay from the sync window; returns (W&B data, GIFs to render)."""
         self._prune_recent_completed_replays(
             recent_completed_replays,
             now_s - window_s,
         )
         if not recent_completed_replays:
-            return {}
+            return None
 
         selected_replay = random.choice(list(recent_completed_replays))
         replay_payload = selected_replay.replay
         if replay_payload is None:
-            return {}
-        replay = cast(GameReplay, replay_payload)
+            return None
 
-        frames = render_replay(replay)
-        video, _ = self._create_wandb_gif_video(
-            frames,
-            attack=selected_replay.total_attack,
-            gif_stem=(
-                "direct_sync"
-                f"_step{self.step}"
-                f"_game{selected_replay.game_number}"
-                f"_attack{selected_replay.total_attack}"
-            ),
+        gif_path = self._temp_gif_path(
+            "direct_sync"
+            f"_step{self.step}"
+            f"_game{selected_replay.game_number}"
+            f"_attack{selected_replay.total_attack}"
         )
-        if video is None:
-            return {}
-
-        return {
-            "model_sync/random_recent_game": video,
+        data: dict[str, object] = {
+            "trainer_step": self.step,
             "model_sync/random_recent_game_number": float(selected_replay.game_number),
             "model_sync/random_recent_game_attack": float(selected_replay.total_attack),
             "model_sync/random_recent_game_age_seconds": max(
@@ -533,6 +537,13 @@ class Trainer:
             ),
             "model_sync/random_recent_game_window_seconds": window_s,
         }
+        gifs = {
+            "model_sync/random_recent_game": (
+                cast(ReplayLike, replay_payload),
+                gif_path,
+            )
+        }
+        return data, gifs
 
     def _current_runtime_override_state(self) -> ResolvedRuntimeOverrides:
         return ResolvedRuntimeOverrides(
@@ -982,26 +993,148 @@ class Trainer:
 
         return next_log_time_s, next_checkpoint_time_s
 
-    def _export_rust_inference_artifacts(
+    def _queue_exported_candidate(
         self,
-        model: TetrisNet,
-        onnx_path: Path,
+        generator: GameGenerator,
+        export: CompletedExport,
         *,
-        export_name: str,
-    ) -> float:
-        export_start = time.perf_counter()
-        full_export_ok = export_onnx(model, onnx_path)
-        if not full_export_ok:
-            raise RuntimeError(
-                f"{export_name} ONNX export failed due to missing dependencies"
+        candidate_gate_schedule: CandidateGateSchedule,
+        log_to_wandb: bool,
+    ) -> None:
+        incumbent_nn_value_weight = generator.incumbent_nn_value_weight()
+        candidate_nn_value_weight = self._compute_candidate_nn_value_weight(
+            current_weight=incumbent_nn_value_weight,
+            config=self.config,
+            cumulative_games=self._cumulative_games_generated(generator),
+        )
+        force_promote = self._force_promote_next_candidate
+        candidate_death_penalty, candidate_overhang_penalty_weight = (
+            self._scaled_penalties_for(
+                generator, nn_value_weight=candidate_nn_value_weight
             )
-        split_export_ok = export_split_models(model, onnx_path)
-        if not split_export_ok:
-            raise RuntimeError(
-                f"{export_name} split-model export failed due to missing dependencies"
+        )
+        queued = generator.queue_candidate_model(
+            str(export.onnx_path),
+            export.step,
+            candidate_nn_value_weight,
+            candidate_death_penalty,
+            candidate_overhang_penalty_weight,
+            force_promote=force_promote,
+        )
+        if queued and force_promote:
+            self._force_promote_next_candidate = False
+        logger.info(
+            "Queued candidate model for evaluator",
+            step=self.step,
+            candidate_step=export.step,
+            path=str(export.onnx_path),
+            queued=queued,
+            force_promote=force_promote,
+            onnx_export_ms=export.export_ms,
+            export_latency_ms=export.latency_ms,
+            incumbent_nn_value_weight=incumbent_nn_value_weight,
+            candidate_nn_value_weight=candidate_nn_value_weight,
+            candidate_gate_failed_promotion_streak=(
+                candidate_gate_schedule.failed_promotion_streak
+            ),
+            candidate_gate_interval_seconds=(
+                candidate_gate_schedule.current_interval_seconds
+            ),
+        )
+        if not queued:
+            self._defer_candidate_gate_export(
+                candidate_gate_schedule,
+                now_s=time.perf_counter(),
             )
-        assert_rust_inference_artifacts(onnx_path)
-        return 1000.0 * (time.perf_counter() - export_start)
+        if not log_to_wandb:
+            return
+        wandb.log(
+            {
+                "trainer_step": self.step,
+                "timing/onnx_export_ms": export.export_ms,
+                "timing/model_export_latency_ms": export.latency_ms,
+                "model_gate/queued_candidate_nn_value_weight": candidate_nn_value_weight,
+                "model_gate/failed_promotion_streak": (
+                    candidate_gate_schedule.failed_promotion_streak
+                ),
+                "model_gate/current_export_interval_seconds": (
+                    candidate_gate_schedule.current_interval_seconds
+                ),
+                "model_gate/next_export_delay_seconds": max(
+                    0.0,
+                    candidate_gate_schedule.next_export_time_s - time.perf_counter(),
+                ),
+            }
+        )
+
+    def _apply_direct_sync(
+        self,
+        generator: GameGenerator,
+        export: CompletedExport,
+        *,
+        recent_completed_replays: deque[CompletedGameLogEntry],
+        window_s: float,
+        next_sync_time_s: float,
+        log_to_wandb: bool,
+    ) -> None:
+        incumbent_nn_value_weight = generator.incumbent_nn_value_weight()
+        synced_nn_value_weight = self._compute_candidate_nn_value_weight(
+            current_weight=incumbent_nn_value_weight,
+            config=self.config,
+            cumulative_games=self._cumulative_games_generated(generator),
+        )
+        synced_death_penalty, synced_overhang_penalty_weight = (
+            self._scaled_penalties_for(
+                generator, nn_value_weight=synced_nn_value_weight
+            )
+        )
+        synced = generator.sync_model_directly(
+            str(export.onnx_path),
+            export.step,
+            synced_nn_value_weight,
+            synced_death_penalty,
+            synced_overhang_penalty_weight,
+        )
+        if synced:
+            self._submit_r2_upload(
+                export.onnx_path,
+                export.step,
+                synced_nn_value_weight,
+                synced_death_penalty,
+                synced_overhang_penalty_weight,
+            )
+        now_s = time.perf_counter()
+        next_sync_delay_seconds = max(0.0, next_sync_time_s - now_s)
+        logger.info(
+            "Synced model directly for self-play",
+            step=self.step,
+            model_step=export.step,
+            path=str(export.onnx_path),
+            synced=synced,
+            onnx_export_ms=export.export_ms,
+            export_latency_ms=export.latency_ms,
+            incumbent_nn_value_weight=incumbent_nn_value_weight,
+            synced_nn_value_weight=synced_nn_value_weight,
+            next_sync_delay_seconds=next_sync_delay_seconds,
+        )
+        if not log_to_wandb:
+            return
+        wandb.log(
+            {
+                "trainer_step": self.step,
+                "timing/onnx_export_ms": export.export_ms,
+                "timing/model_export_latency_ms": export.latency_ms,
+                "model_sync/direct_sync_succeeded": 1.0 if synced else 0.0,
+                "model_sync/nn_value_weight": synced_nn_value_weight,
+                "model_sync/next_sync_delay_seconds": next_sync_delay_seconds,
+            }
+        )
+        recent_game = self._select_direct_sync_recent_game(
+            recent_completed_replays, now_s=now_s, window_s=window_s
+        )
+        if recent_game is not None:
+            data, gifs = recent_game
+            self._require_background_process().submit_gif_log(data, gifs)
 
     def _candidate_gate_timing_config(self) -> tuple[float, float, float | None]:
         base_interval_seconds = self._model_sync_interval_seconds()
@@ -1331,32 +1464,28 @@ class Trainer:
                     )
                 wandb_data["eval/nn_value_weight"] = promoted_nn_value_weight
 
+            gifs: dict[str, tuple[ReplayLike, Path]] = {}
             best_replay = event.get("best_game_replay")
             worst_replay = event.get("worst_game_replay")
             if best_replay is not None:
-                frames = render_replay(best_replay)
-                video, _ = self._create_wandb_gif_video(
-                    frames,
-                    attack=best_replay.total_attack,
-                    gif_stem=(
+                gifs["eval/best_trajectory"] = (
+                    best_replay,
+                    self._temp_gif_path(
                         f"eval_best_step{self.step}_attack{best_replay.total_attack}"
                     ),
                 )
-                if video is not None:
-                    wandb_data["eval/best_trajectory"] = video
             if worst_replay is not None:
-                frames = render_replay(worst_replay)
-                video, _ = self._create_wandb_gif_video(
-                    frames,
-                    attack=worst_replay.total_attack,
-                    gif_stem=(
+                gifs["eval/worst_trajectory"] = (
+                    worst_replay,
+                    self._temp_gif_path(
                         f"eval_worst_step{self.step}_attack{worst_replay.total_attack}"
                     ),
                 )
-                if video is not None:
-                    wandb_data["eval/worst_trajectory"] = video
 
-            wandb.log(wandb_data)
+            if gifs:
+                self._require_background_process().submit_gif_log(wandb_data, gifs)
+            else:
+                wandb.log(wandb_data)
 
     def _build_generator_mcts_config(self) -> MCTSConfig:
         mcts_config = MCTSConfig()
@@ -2022,31 +2151,84 @@ class Trainer:
     ) -> None:
         if self._r2_settings is None:
             return
-        if model_step <= self._r2_last_uploaded_step:
+        with self._r2_upload_lock:
+            if model_step <= self._r2_last_uploaded_step:
+                return
+            if not onnx_path.exists():
+                logger.warning(
+                    "trainer.r2_upload_skipped_missing_bundle",
+                    path=str(onnx_path),
+                    step=model_step,
+                )
+                return
+            try:
+                upload_model_bundle(
+                    settings=self._r2_settings,
+                    onnx_path=onnx_path,
+                    step=model_step,
+                    nn_value_weight=nn_value_weight,
+                    death_penalty=death_penalty,
+                    overhang_penalty_weight=overhang_penalty_weight,
+                )
+                self._r2_last_uploaded_step = model_step
+            except Exception:
+                logger.exception(
+                    "trainer.r2_upload_failed",
+                    path=str(onnx_path),
+                    step=model_step,
+                )
+
+    def _r2_upload_in_flight(self) -> bool:
+        future = self._r2_upload_future
+        return future is not None and not future.done()
+
+    def _submit_r2_upload(
+        self,
+        onnx_path: Path,
+        model_step: int,
+        nn_value_weight: float,
+        death_penalty: float,
+        overhang_penalty_weight: float,
+    ) -> None:
+        """Upload a synced bundle off the training thread.
+
+        The caller must not sync another model while this is in flight: the
+        next sync lets Rust delete this bundle's files mid-upload.
+        """
+        if self._r2_settings is None:
             return
-        if not onnx_path.exists():
-            logger.warning(
-                "trainer.r2_upload_skipped_missing_bundle",
-                path=str(onnx_path),
-                step=model_step,
+        if self._r2_upload_executor is None:
+            self._r2_upload_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="r2-model-upload"
             )
+        self._r2_upload_future = self._r2_upload_executor.submit(
+            self._upload_to_r2_if_enabled,
+            onnx_path,
+            model_step,
+            nn_value_weight,
+            death_penalty,
+            overhang_penalty_weight,
+        )
+
+    def _shutdown_background_work(self) -> None:
+        upload_executor = self._r2_upload_executor
+        self._r2_upload_executor = None
+        self._r2_upload_future = None
+        if upload_executor is not None:
+            upload_executor.shutdown(wait=True)
+
+        background_process = self._background_process
+        if background_process is None:
             return
-        try:
-            upload_model_bundle(
-                settings=self._r2_settings,
-                onnx_path=onnx_path,
-                step=model_step,
-                nn_value_weight=nn_value_weight,
-                death_penalty=death_penalty,
-                overhang_penalty_weight=overhang_penalty_weight,
-            )
-            self._r2_last_uploaded_step = model_step
-        except Exception:
-            logger.exception(
-                "trainer.r2_upload_failed",
-                path=str(onnx_path),
-                step=model_step,
-            )
+        self._log_completed_gif_logs()
+        self._background_process = None
+        orphaned_onnx_path = background_process.shutdown()
+        if orphaned_onnx_path is None:
+            return
+        for path in required_model_artifact_paths(
+            orphaned_onnx_path
+        ) + optional_model_artifact_paths(orphaned_onnx_path):
+            path.unlink(missing_ok=True)
 
     def _publish_incumbent_to_r2_if_enabled(
         self, generator: GameGenerator, *, reason: str
@@ -2112,36 +2294,24 @@ class Trainer:
             f"(source={source_path_string})"
         )
 
-    def _create_wandb_gif_video(
-        self,
-        frames: list,
-        attack: int,
-        *,
-        gif_stem: str | None = None,
-    ) -> tuple[wandb.Video | None, Path | None]:
-        if not frames:
-            return None, None
+    @staticmethod
+    def _temp_gif_path(gif_stem: str) -> Path:
+        return Path(tempfile.gettempdir()) / f"{gif_stem}.gif"
 
-        if gif_stem is None:
-            gif_stem = f"eval_step{self.step}_attack{attack}"
-        gif_path = Path(tempfile.gettempdir()) / f"{gif_stem}.gif"
+    def _require_background_process(self) -> TrainerBackgroundProcess:
+        if self._background_process is None:
+            raise RuntimeError("Trainer background process is not running")
+        return self._background_process
 
-        try:
-            create_trajectory_gif(
-                frames=frames,
-                output_path=str(gif_path),
-                duration=DEFAULT_GIF_FRAME_DURATION_MS,
-            )
-
-            video = wandb.Video(
-                str(gif_path),
-                format="gif",
-            )
-            self._pending_eval_gif_paths.append(gif_path)
-            return video, gif_path
-        except BaseException:
-            gif_path.unlink(missing_ok=True)
-            raise
+    def _log_completed_gif_logs(self) -> None:
+        if self._background_process is None:
+            return
+        for completed in self._background_process.drain_gif_logs():
+            data = dict(completed.data)
+            for key, gif_path in completed.gif_paths.items():
+                data[key] = wandb.Video(str(gif_path), format="gif")
+                self._pending_eval_gif_paths.append(gif_path)
+            wandb.log(data)
 
     def _cleanup_wandb_gif_files(self) -> None:
         for gif_path in self._pending_eval_gif_paths:
@@ -2340,6 +2510,13 @@ class Trainer:
                     stop_error = error
                 logger.exception("Failed to finalize async checkpoint saver")
 
+            try:
+                self._shutdown_background_work()
+            except BaseException as error:
+                if stop_error is None:
+                    stop_error = error
+                logger.exception("Failed to finalize trainer background work")
+
             # Restore uncompiled model for final save + ONNX export
             self.model = export_model
 
@@ -2430,7 +2607,7 @@ class Trainer:
 
         # Export initial model (full ONNX + split models for cached Rust inference)
         initial_export_model = self.ema_model or self._export_model
-        self._export_rust_inference_artifacts(
+        export_rust_inference_bundle(
             initial_export_model,
             onnx_path,
             export_name="Initial",
@@ -2552,6 +2729,9 @@ class Trainer:
             config=str(self.config),
         )
         self._async_checkpoint_saver = AsyncCheckpointSaver(self.weight_manager)
+        self._background_process = TrainerBackgroundProcess(
+            self.config.network.model_dump()
+        )
         use_device_replay_mirror = self._use_device_replay_mirror()
         staged_batch_size = (
             self.config.optimizer.batch_size * self.config.replay.prefetch_batches
@@ -2957,181 +3137,67 @@ class Trainer:
                         post_step_time,
                     )
 
-                # Export updated model for generator
+                # Export updated model for generator. The export runs in the
+                # background process; the result is applied on a later step.
+                background_process = self._require_background_process()
+                self._log_completed_gif_logs()
                 if candidate_gate_schedule is not None:
-                    gate_busy = generator.candidate_gate_busy()
-                    if (
-                        not gate_busy
+                    completed_export = background_process.poll_export()
+                    if completed_export is not None:
+                        self._queue_exported_candidate(
+                            generator,
+                            completed_export,
+                            candidate_gate_schedule=candidate_gate_schedule,
+                            log_to_wandb=log_to_wandb,
+                        )
+                    elif (
+                        not background_process.export_in_flight
                         and post_step_time >= candidate_gate_schedule.next_export_time_s
+                        and not generator.candidate_gate_busy()
                     ):
-                        candidate_onnx_path = (
-                            candidate_model_dir / f"candidate_step_{self.step}.onnx"
-                        )
-                        candidate_export_model = self.ema_model or export_model
-                        onnx_export_ms = self._export_rust_inference_artifacts(
-                            candidate_export_model,
-                            candidate_onnx_path,
-                            export_name="Candidate",
-                        )
-                        incumbent_nn_value_weight = (
-                            generator.incumbent_nn_value_weight()
-                        )
-                        candidate_nn_value_weight = (
-                            self._compute_candidate_nn_value_weight(
-                                current_weight=incumbent_nn_value_weight,
-                                config=self.config,
-                                cumulative_games=self._cumulative_games_generated(
-                                    generator
-                                ),
-                            )
-                        )
-                        force_promote = self._force_promote_next_candidate
-                        (
-                            candidate_death_penalty,
-                            candidate_overhang_penalty_weight,
-                        ) = self._scaled_penalties_for(
-                            generator, nn_value_weight=candidate_nn_value_weight
-                        )
-                        queued = generator.queue_candidate_model(
-                            str(candidate_onnx_path),
-                            self.step,
-                            candidate_nn_value_weight,
-                            candidate_death_penalty,
-                            candidate_overhang_penalty_weight,
-                            force_promote=force_promote,
-                        )
-                        if queued and force_promote:
-                            self._force_promote_next_candidate = False
-                        logger.info(
-                            "Queued candidate model for evaluator",
+                        background_process.submit_export(
+                            self.ema_model or export_model,
                             step=self.step,
-                            path=str(candidate_onnx_path),
-                            queued=queued,
-                            force_promote=force_promote,
-                            onnx_export_ms=onnx_export_ms,
-                            incumbent_nn_value_weight=incumbent_nn_value_weight,
-                            candidate_nn_value_weight=candidate_nn_value_weight,
-                            candidate_gate_failed_promotion_streak=(
-                                candidate_gate_schedule.failed_promotion_streak
-                            ),
-                            candidate_gate_interval_seconds=(
-                                candidate_gate_schedule.current_interval_seconds
+                            onnx_path=(
+                                candidate_model_dir / f"candidate_step_{self.step}.onnx"
                             ),
                         )
-                        if not queued:
-                            self._defer_candidate_gate_export(
-                                candidate_gate_schedule,
-                                now_s=time.perf_counter(),
-                            )
-                        if log_to_wandb:
-                            next_candidate_export_delay_seconds = max(
-                                0.0,
-                                candidate_gate_schedule.next_export_time_s
-                                - time.perf_counter(),
-                            )
-                            wandb.log(
-                                {
-                                    "trainer_step": self.step,
-                                    "timing/onnx_export_ms": onnx_export_ms,
-                                    "model_gate/queued_candidate_nn_value_weight": candidate_nn_value_weight,
-                                    "model_gate/failed_promotion_streak": (
-                                        candidate_gate_schedule.failed_promotion_streak
-                                    ),
-                                    "model_gate/current_export_interval_seconds": (
-                                        candidate_gate_schedule.current_interval_seconds
-                                    ),
-                                    "model_gate/next_export_delay_seconds": (
-                                        next_candidate_export_delay_seconds
-                                    ),
-                                }
-                            )
                 else:
                     if next_model_sync_time_s is None:
                         raise RuntimeError("Direct model sync schedule is unavailable")
                     if direct_sync_interval_seconds is None:
                         raise RuntimeError("Direct model sync interval is unavailable")
-                    if post_step_time >= next_model_sync_time_s:
-                        sync_onnx_path = (
-                            candidate_model_dir / f"sync_step_{self.step}.onnx"
+                    # Hold a finished export until the previous bundle's R2
+                    # upload is done; syncing lets Rust delete those files.
+                    completed_export = (
+                        None
+                        if self._r2_upload_in_flight()
+                        else background_process.poll_export()
+                    )
+                    if completed_export is not None:
+                        self._apply_direct_sync(
+                            generator,
+                            completed_export,
+                            recent_completed_replays=recent_completed_replays,
+                            window_s=direct_sync_interval_seconds,
+                            next_sync_time_s=next_model_sync_time_s,
+                            log_to_wandb=log_to_wandb,
                         )
-                        sync_export_model = self.ema_model or export_model
-                        onnx_export_ms = self._export_rust_inference_artifacts(
-                            sync_export_model,
-                            sync_onnx_path,
-                            export_name="Direct sync",
+                    elif (
+                        not background_process.export_in_flight
+                        and post_step_time >= next_model_sync_time_s
+                    ):
+                        background_process.submit_export(
+                            self.ema_model or export_model,
+                            step=self.step,
+                            onnx_path=candidate_model_dir
+                            / f"sync_step_{self.step}.onnx",
                         )
-                        incumbent_nn_value_weight = (
-                            generator.incumbent_nn_value_weight()
-                        )
-                        synced_nn_value_weight = (
-                            self._compute_candidate_nn_value_weight(
-                                current_weight=incumbent_nn_value_weight,
-                                config=self.config,
-                                cumulative_games=self._cumulative_games_generated(
-                                    generator
-                                ),
-                            )
-                        )
-                        (
-                            synced_death_penalty,
-                            synced_overhang_penalty_weight,
-                        ) = self._scaled_penalties_for(
-                            generator, nn_value_weight=synced_nn_value_weight
-                        )
-                        synced = generator.sync_model_directly(
-                            str(sync_onnx_path),
-                            self.step,
-                            synced_nn_value_weight,
-                            synced_death_penalty,
-                            synced_overhang_penalty_weight,
-                        )
-                        if synced:
-                            self._upload_to_r2_if_enabled(
-                                sync_onnx_path,
-                                self.step,
-                                synced_nn_value_weight,
-                                synced_death_penalty,
-                                synced_overhang_penalty_weight,
-                            )
-                        sync_now_s = time.perf_counter()
                         next_model_sync_time_s = roll_interval_deadline(
                             next_model_sync_time_s,
                             direct_sync_interval_seconds,
-                            sync_now_s,
+                            time.perf_counter(),
                         )
-                        logger.info(
-                            "Synced model directly for self-play",
-                            step=self.step,
-                            path=str(sync_onnx_path),
-                            synced=synced,
-                            onnx_export_ms=onnx_export_ms,
-                            incumbent_nn_value_weight=incumbent_nn_value_weight,
-                            synced_nn_value_weight=synced_nn_value_weight,
-                            next_sync_delay_seconds=max(
-                                0.0, next_model_sync_time_s - sync_now_s
-                            ),
-                        )
-                        if log_to_wandb:
-                            sync_wandb_data: dict[str, object] = {
-                                "trainer_step": self.step,
-                                "timing/onnx_export_ms": onnx_export_ms,
-                                "model_sync/direct_sync_succeeded": (
-                                    1.0 if synced else 0.0
-                                ),
-                                "model_sync/nn_value_weight": synced_nn_value_weight,
-                                "model_sync/next_sync_delay_seconds": max(
-                                    0.0,
-                                    next_model_sync_time_s - time.perf_counter(),
-                                ),
-                            }
-                            sync_wandb_data.update(
-                                self._build_direct_sync_recent_game_wandb_data(
-                                    recent_completed_replays,
-                                    now_s=sync_now_s,
-                                    window_s=direct_sync_interval_seconds,
-                                )
-                            )
-                            wandb.log(sync_wandb_data)
 
                 # Queue checkpoint/export work on the background saver.
                 if post_step_time >= next_checkpoint_time_s:

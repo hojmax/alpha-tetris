@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import shutil
+import time
 from pathlib import Path
 
 import structlog
 
-from tetris_bot.ml.weights import split_model_paths
+from tetris_bot.ml.network import TetrisNet
+from tetris_bot.ml.weights import export_onnx, export_split_models, split_model_paths
 
 logger = structlog.get_logger()
 
@@ -19,6 +21,26 @@ def assert_rust_inference_artifacts(onnx_path: Path) -> None:
             "Model export incomplete for Rust inference; missing artifacts: "
             + ", ".join(missing_paths)
         )
+
+
+def export_rust_inference_bundle(
+    model: TetrisNet,
+    onnx_path: Path,
+    *,
+    export_name: str,
+) -> float:
+    """Export the full ONNX graph plus the split Rust-inference files; returns ms."""
+    export_start = time.perf_counter()
+    if not export_onnx(model, onnx_path):
+        raise RuntimeError(
+            f"{export_name} ONNX export failed due to missing dependencies"
+        )
+    if not export_split_models(model, onnx_path):
+        raise RuntimeError(
+            f"{export_name} split-model export failed due to missing dependencies"
+        )
+    assert_rust_inference_artifacts(onnx_path)
+    return 1000.0 * (time.perf_counter() - export_start)
 
 
 def required_model_artifact_paths(onnx_path: Path) -> list[Path]:
