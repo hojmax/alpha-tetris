@@ -249,6 +249,11 @@ class RunConfig(ConfigModel):
     checkpoint_interval_seconds: float
     log_interval_seconds: float
     save_interval_seconds: float
+    # Self-play total-attack distribution logged to W&B (histogram + plot) over
+    # the last `attack_histogram_window_games` games; interval 0 disables it.
+    # Defaulted so configs saved before these knobs existed still load.
+    attack_histogram_window_games: int = Field(default=1000, gt=0)
+    attack_histogram_interval_seconds: float = Field(default=600.0, ge=0.0)
     run_dir: Path | None
     checkpoint_dir: Path | None
     data_dir: Path | None

@@ -82,6 +82,8 @@ run:
   checkpoint_interval_seconds: 10800.0
   log_interval_seconds: 10.0
   save_interval_seconds: 10800.0
+  attack_histogram_window_games: 1000
+  attack_histogram_interval_seconds: 600.0
   run_dir: null
   checkpoint_dir: null
   data_dir: null

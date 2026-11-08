@@ -200,6 +200,7 @@ def configure_wandb(
         "incumbent/*",
         "model_gate/*",
         "runtime_override/*",
+        "game_dist/*",
     ]:
         wandb.define_metric(ns, step_metric="trainer_step")
     wandb.define_metric("model_gate_time/*", step_metric="wall_time_hours")
