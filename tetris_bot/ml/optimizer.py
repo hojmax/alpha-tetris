@@ -54,6 +54,17 @@ def split_muon_adamw_params(
     return muon_params, adamw_params
 
 
+def use_fused_adamw(params: list[nn.Parameter]) -> bool:
+    """Use PyTorch's fused AdamW kernel when every param lives on CUDA or MPS.
+
+    The fused kernel updates all ~80 AdamW tensors in one launch; the for-loop
+    and foreach paths cost hundreds of launches (and the for-loop path also a
+    Python loop) per step. Elsewhere (CPU) keep PyTorch's default choice.
+    """
+    device_types = {param.device.type for param in params}
+    return len(device_types) == 1 and device_types <= {"cuda", "mps"}
+
+
 class OptimizerBundle:
     """Wraps Muon (2D hidden weights) and AdamW (everything else)."""
 
@@ -63,17 +74,18 @@ class OptimizerBundle:
         *,
         learning_rate: float,
         weight_decay: float,
-        adamw_foreach: bool,
         muon_adjust_lr_fn: str | None = "match_rms_adamw",
     ):
         # `match_rms_adamw` rescales Muon's effective step to AdamW's RMS, so a
         # single shared LR works for both inner optimizers.
         muon_params, adamw_params = split_muon_adamw_params(model)
+        # `None` keeps PyTorch's default implementation choice.
+        self._adamw_fused: bool | None = True if use_fused_adamw(adamw_params) else None
         self.adamw = torch.optim.AdamW(
             adamw_params,
             lr=learning_rate,
             weight_decay=weight_decay,
-            foreach=adamw_foreach,
+            fused=self._adamw_fused,
         )
         self.muon = torch.optim.Muon(
             muon_params,
@@ -90,6 +102,7 @@ class OptimizerBundle:
             learning_rate=learning_rate,
             weight_decay=weight_decay,
             muon_adjust_lr_fn=muon_adjust_lr_fn,
+            adamw_fused=bool(self._adamw_fused),
         )
 
     @property
@@ -130,6 +143,14 @@ class OptimizerBundle:
                 f"{{'adamw', 'muon'}}; got {sorted(state_dict)}"
             )
         self.adamw.load_state_dict(state_dict["adamw"])
+        # `Optimizer.load_state_dict` adopts the saved param-group flags, so a
+        # checkpoint written by a different implementation (e.g. foreach=False)
+        # would otherwise silently switch this run back to it. Step-counter
+        # placement for the restored flags is fixed by
+        # `sanitize_optimizer_state_steps` at every load/step boundary.
+        for group in self.adamw.param_groups:
+            group["fused"] = self._adamw_fused
+            group["foreach"] = None
         self.muon.load_state_dict(state_dict["muon"])
 
 

@@ -1,4 +1,4 @@
-.PHONY: run install ensure-rust ensure-system-deps build build-ort build-dev clean rebuild test check play viz viz-policy-grid train run-generator replay profile profile-samply optimize sweep-lr-model eval-nn-value-weight compare-offline-network-scaling compare-offline-spatial-policy compare-warm-start-trunk-sizes sweep-mcts-config warm-start download-wandb-training-data
+.PHONY: run install ensure-rust ensure-system-deps build build-ort build-dev clean rebuild test check play viz viz-policy-grid train run-generator replay profile profile-samply optimize sweep-lr-model eval-nn-value-weight compare-offline-network-scaling compare-offline-spatial-policy compare-warm-start-trunk-sizes search-depth-info-gain sweep-mcts-config warm-start download-wandb-training-data
 
 # Source cargo environment if available
 SHELL := /bin/bash
@@ -251,6 +251,10 @@ compare-offline-spatial-policy: $(INSTALL_MARKER)
 # Usage: make compare-warm-start-trunk-sizes ARGS="--source_run_dir training_runs/v32"
 compare-warm-start-trunk-sizes: $(RELEASE_MARKER)
 	PYTHONPATH=$(CURDIR) $(PYTHON) tetris_bot/scripts/ablations/compare_warm_start_trunk_sizes.py $(ARGS)
+
+# Leela-Zero-style information gain per MCTS visit to pick the per-move search depth.
+search-depth-info-gain: $(RELEASE_MARKER)
+	PYTHONPATH=$(CURDIR) $(PYTHON) investigations/optimal_search_depth/search_depth_info_gain.py $(ARGS)
 
 # Measure marginal utility of policy vs value loss by injecting runtime output noise and running games.
 # Usage: make loss-sensitivity ARGS="training_runs/v32"

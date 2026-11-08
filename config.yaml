@@ -31,7 +31,7 @@ optimizer:
   mirror_augmentation_probability: 0.5
   log_individual_games_to_wandb: false
 self_play:
-  num_simulations: 2000
+  num_simulations: 500  # info-gain plateau + eval sweep, see investigations/optimal_search_depth
   c_puct: 1.5
   temperature: 1.0
   dirichlet_alpha: 0.02
@@ -41,6 +41,8 @@ self_play:
   visit_sampling_epsilon: 0.2
   mcts_seed: 0
   reuse_tree: true
+  count_reused_visits: false
+  min_new_simulations: 0
   num_workers: 32
   max_placements: 50
   penalty_schedule:
@@ -70,6 +72,7 @@ replay:
   replay_mirror_refresh_seconds: 10.0
   replay_mirror_delta_chunk_examples: 65536
   pin_memory_batches: true
+  max_train_samples_per_new_example: 0.0
 run:
   project_name: tetris-alphazero
   run_name: null

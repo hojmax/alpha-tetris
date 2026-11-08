@@ -64,6 +64,7 @@ make train      # training entry point (requires tmux; auto-loads machine optimi
 make warm-start # create a new warm-started run dir from another run's training_data.npz
 make compare-offline-spatial-policy # compare current gated fusion vs 4x20x10 spatial policy decoder offline
 make compare-warm-start-trunk-sizes # warm-start several trunk sizes from one replay buffer, then benchmark attack vs throughput
+make search-depth-info-gain # Leela-style policy information gain per MCTS visit (see investigations/optimal_search_depth/)
 make profile    # performance profile runner
 make optimize   # auto-tune build/backend/workers for this machine (with cache)
 ```
@@ -93,7 +94,7 @@ make compare-warm-start-trunk-sizes
 tetris_core/src/
 ├── game/       # deterministic Tetris rules and environment
 ├── search/     # MCTS implementation
-├── inference/  # ONNX inference backends
+├── inference/  # native conv trunk + board MLP, ONNX heads backends
 ├── runtime/    # self-play and evaluator runtime
 ├── replay/     # replay and NPZ persistence
 └── lib.rs      # PyO3 module exports
@@ -152,9 +153,12 @@ Ownership split:
 ## Important Defaults (TrainingConfig)
 
 - Network: `trunk_channels=32`, `num_conv_residual_blocks=5`, `reduction_channels=32`, `board_stats_hidden=32`, `board_proj_hidden=512`, `fc_hidden=256`, `aux_hidden=128`, `fusion_hidden=256`, `num_fusion_blocks=1`.
-- MCTS: `num_simulations=2000`, `c_puct=1.5`, `temperature=1.0`, `reuse_tree=true`, `max_placements=50`.
+- MCTS: `num_simulations=500` (policy info-gain plateau 240-542 sims; 500 keeps ~95% of 2000-sim attack at 3.1x throughput; see `investigations/optimal_search_depth/`), `c_puct=1.5`, `temperature=1.0`, `reuse_tree=true`, `max_placements=50`.
+- Search budget: by default every move adds `num_simulations` new simulations on top of the visits carried in by tree reuse (~37% of a root's final visits, measured at 2000 sims). `self_play.count_reused_visits=true` turns `num_simulations` into a per-search visit budget (new sims = `max(min_new_simulations, num_simulations - carried)`); default off. At a fixed network, budget 2000 (min 200) ran 1.54x faster than plain 2000 sims for -0.7 greedy attack (50.0 vs 50.8, 144 seeds), about the same trade as lowering `num_simulations` (plain 1000 sims: 49.3 at 0.55x cost); 144 games cannot tell the two apart. Not measured at the 500-sim default.
 - Training: `batch_size=2048`, `learning_rate=5e-4` with linear decay to `1e-4`, `weight_decay=5e-5`, `grad_clip_norm=10.0`.
 - Workers/buffer: `num_workers=7`, replay ring buffer size `7_000_000`.
+- Replay ratio: the trainer is free-running by default (`replay.max_train_samples_per_new_example=0`). The user's 32-worker CUDA run drew ~320 training samples per generated example (11.6 steps/s x 2048 vs ~75 examples/s), so trainer speedups do not speed learning; self-play throughput does. Set the cap (> 0) to make the trainer sleep whenever this session's samples drawn exceed `cap x` newly generated/ingested examples (preloaded replay does not count). Logged as `replay/samples_per_generated_example`, `replay/session_samples_per_new_example`, `throughput/replay_ratio_throttle_fraction`.
+- Training on Apple Silicon (MPS) next to local self-play costs self-play ~50% throughput through unified-memory contention (worker IPC drops; trainer CPU use is only ~0.2 cores); throttling the trainer (the cap above) recovers it roughly in proportion to the GPU duty cycle. Discrete-GPU (CUDA) hosts do not have this effect; there the trainer thread costs about one CPU core.
 - Bootstrap: starts no-network, typically `bootstrap_num_simulations=4000` until first promotion.
 - Candidate gate: deterministic fixed-seed eval window (default 20 games, no Dirichlet noise, `visit_sampling_epsilon=0`, fixed MCTS seed), promote when the candidate's evaluation average is greater than or equal to the stored incumbent evaluation average. Fixed-seed eval trajectories are not added to the replay buffer. Candidate export timing now uses `run.model_sync_interval_seconds` as the base interval, adds `run.model_sync_failure_backoff_seconds` after each failed promotion (optionally capped by `run.model_sync_max_interval_seconds`), measures the cooldown from eval start, and suppresses exports while a candidate is pending/evaluating so long evals do not churn throwaway ONNX bundles. Set `self_play.use_candidate_gating=false` to disable the evaluator worker entirely; in that mode all workers stay on generation and the trainer directly syncs a freshly exported incumbent to everyone every `run.model_sync_interval_seconds`.
 - When `self_play.use_candidate_gating=false`, WandB direct-sync logs now also attach `model_sync/random_recent_game`: a GIF sampled from completed replays whose completion timestamps fall within the last `run.model_sync_interval_seconds`.
@@ -164,8 +168,9 @@ Ownership split:
 Memory note:
 
 - CPU RAM usually becomes the bottleneck before GPU VRAM.
+- Model weights are shared process-wide: `TetrisNN::load` goes through `inference/weight_registry.rs`, so all workers loading the same bundle (same canonical paths, sizes, mtimes) share one `Arc<ModelWeights>` and old models are freed when the last worker drops them. Private per-worker copies made multi-worker self-play DRAM-bandwidth-bound (M5 Pro, 18 workers: 27.1 -> 52.6 placements/s from sharing alone). Don't add load paths that bypass it.
 - Biggest levers: `buffer_size`, `num_workers`, `bootstrap_num_simulations`, replay mirror/staging settings.
-- Rust per-worker caches (`PLACEMENT_CACHE_MAX_ENTRIES`, `BOARD_ANALYSIS_CACHE_MAX_ENTRIES`) scale with worker count.
+- Rust per-worker caches scale with worker count: the placement cache (`PLACEMENT_CACHE_MAX_ENTRIES` = 30K entries, ~1 KB each) and the NN board-embedding cache (`BOARD_CACHE_MAX_ENTRIES` = 64K entries, ~1 KB each, ~64 MB per worker when full; a game misses only ~2.4-4.1K boards and later games never hit earlier games' entries, so the old 1M cap only cost ~1.1 GB/worker). Board overhang/hole analysis is computed directly (bitboard), with no global cache.
 
 Disk note:
 
@@ -184,7 +189,8 @@ Disk note:
 
 1. Edit `tetris_bot/ml/network.py`.
 2. Update Rust inference encoding in `tetris_core/src/inference/mod.rs` if feature schema changes.
-3. Retrain/export ONNX artifacts.
+3. The whole network runs natively in Rust (no tract/ORT at inference time). `tetris_core/src/inference/conv.rs` reads the conv trunk from `X.conv.onnx` and strictly pattern-matches the exported `ConvBackbone` graph; `tetris_core/src/inference/heads.rs` reads `X.heads.onnx` initializers by PyTorch parameter name. Any change to `ConvBackbone`/`ResidualConvBlock`/GroupNorm/SiLU structure or to the heads (aux MLP, board/aux concatenation + `fusion_fc`, residual fusion blocks, policy/value heads) must be mirrored there; loading fails loudly on any unexpected graph structure.
+4. Retrain/export ONNX artifacts.
 
 ### Train / Resume
 
@@ -215,7 +221,7 @@ make optimize
 ```
 
 Set `MODEL_PROFILE=<existing-onnx-path>` when the Makefile default model path is missing.
-Set `TETRIS_NN_BACKEND=ort` to profile ONNX Runtime instead of default `tract`.
+Inference no longer goes through tract/ORT: the conv trunk, board MLP and heads all run natively, so `TETRIS_NN_BACKEND` is not read and the `nn-ort` feature / `make build-ort` no longer change inference (cleanup pending).
 `make optimize` is fast by default; for an exhaustive sweep: `make optimize OPT_BACKEND_STRATEGY=exhaustive OPT_WORKER_SEARCH=grid OPT_GAMES=40 OPT_SIMS=500`.
 Results written to `benchmarks/profiles/optimize_cache/<machine_fingerprint>.env`; `make train` computes the current machine fingerprint and loads the matching env (runs optimize first if missing).
 Do NOT use `maturin develop` — use `maturin build --out tetris_core/dist` then `$(PYTHON) -m pip install` (respects `.venv` `sys.prefix` correctly).
@@ -228,6 +234,8 @@ cd tetris_core && PYO3_PYTHON="$(cd .. && pwd)/.venv/bin/python" cargo test
 ```
 
 In feature worktrees, use the primary checkout virtualenv path for `PYO3_PYTHON`.
+Native conv trunk check against a real bundle: `TETRIS_TEST_CONV_ONNX=<run>/checkpoints/incumbent.conv.onnx cargo test --release incumbent -- --nocapture` (skipped when unset).
+SIMD kernels have NEON (aarch64), runtime-detected AVX2+FMA (x86_64) and portable paths; on Apple Silicon compile-check the x86 path with `PYO3_CROSS_PYTHON_VERSION=3.12 cargo check --release --tests --target x86_64-apple-darwin` (needs `rustup target add x86_64-apple-darwin`; it cannot run without Rosetta).
 If you see `ModuleNotFoundError: No module named 'tetris_core.tetris_core'`, the native extension is missing for the active interpreter; rebuild with `make build-dev` (or `make build`) in that same `.venv`.
 
 ## Data/Artifacts Notes

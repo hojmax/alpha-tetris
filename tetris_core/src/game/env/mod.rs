@@ -9,6 +9,7 @@ pub(crate) mod global_cache;
 mod lock_delay;
 mod movement;
 mod piece_management;
+mod piece_queue;
 mod placement;
 mod pymethods;
 mod state;

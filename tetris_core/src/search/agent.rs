@@ -13,12 +13,14 @@ use crate::replay::ReplayMove;
 use super::config::MCTSConfig;
 use super::export::export_decision_node;
 use super::nodes::DecisionNode;
+use super::nodes::NO_CHANCE_OUTCOME;
 use super::results::{
     GameResult, GameStats, GameTreePlayback, GameTreeStep, MCTSResult, MCTSTreeExport,
     TrainingExample, TraversalStats, TreeNodeExport, TreeStats, TreeStatsAccumulator,
 };
 use super::search::{
-    extract_subtree, run_search, search_internal, search_internal_without_nn, NO_CHANCE_OUTCOME,
+    extract_subtree, run_search, search_internal, search_internal_without_nn,
+    search_root_visit_snapshots,
 };
 use crate::game::action_space::HOLD_ACTION_INDEX;
 use crate::game::constants::QUEUE_SIZE;
@@ -113,7 +115,6 @@ fn realized_chance_outcome(env: &TetrisEnv, action_reveals_new_visible_piece: bo
     if action_reveals_new_visible_piece {
         env.piece_queue
             .get(QUEUE_SIZE - 1)
-            .copied()
             .expect("Visible queue tail should exist when an action reveals a new piece")
     } else {
         NO_CHANCE_OUTCOME
@@ -208,10 +209,10 @@ impl MCTSAgent {
             return Err(PyValueError::new_err("No model loaded"));
         };
 
-        let valid_actions = env.get_cached_valid_action_indices_arc();
+        let valid_actions = env.get_cached_valid_action_indices();
         nn.predict_with_valid_actions(
             env,
-            valid_actions.as_slice(),
+            &valid_actions,
             max_placements,
             prediction_noise_from_config(&self.config),
         )
@@ -441,6 +442,40 @@ impl MCTSAgent {
             search_internal(&self.config, nn, env, policy, nn_value, add_noise);
         Some(mcts_result)
     }
+
+    /// Run one fresh search (no root noise) and snapshot root action visit counts after
+    /// each requested simulation count. `config.num_simulations` is ignored.
+    ///
+    /// Args:
+    ///     env: The game state to search from
+    ///     snapshot_counts: Ascending simulation counts at which to record root visits
+    ///
+    /// Returns:
+    ///     Tuple of (masked NN prior policy, per-snapshot root visit counts), or None if
+    ///     no model is loaded or the state has no valid actions
+    pub fn search_root_visit_snapshots(
+        &self,
+        env: &TetrisEnv,
+        snapshot_counts: Vec<u32>,
+    ) -> Option<(Vec<f32>, Vec<Vec<u32>>)> {
+        let nn = self.nn.as_ref()?;
+        let mask = crate::inference::get_action_mask(env);
+        if !mask.iter().any(|&x| x) {
+            return None;
+        }
+
+        let (policy, nn_value) = nn
+            .predict_masked(
+                env,
+                &mask,
+                self.config.max_placements as usize,
+                prediction_noise_from_config(&self.config),
+            )
+            .expect("Neural network prediction failed");
+        let snapshots =
+            search_root_visit_snapshots(&self.config, nn, env, &policy, nn_value, &snapshot_counts);
+        Some((policy, snapshots))
+    }
 }
 
 impl MCTSAgent {
@@ -561,7 +596,7 @@ impl MCTSAgent {
             if self.config.reuse_tree && should_attempt_tree_reuse {
                 if let Some(root) = root {
                     let chance_outcome = if action_reveals_new_visible_piece {
-                        env.piece_queue.get(QUEUE_SIZE - 1).copied()
+                        env.piece_queue.get(QUEUE_SIZE - 1)
                     } else {
                         Some(NO_CHANCE_OUTCOME)
                     };
@@ -848,7 +883,7 @@ impl MCTSAgent {
 
 #[cfg(test)]
 mod tests {
-    use super::super::nodes::{DecisionNode, MCTSNode};
+    use super::super::nodes::DecisionNode;
     use super::*;
     use crate::search::NUM_ACTIONS;
 
@@ -913,33 +948,29 @@ mod tests {
 
         // The root should have children after search
         assert!(
-            !root_after.children.is_empty(),
+            root_after.has_children(),
             "Root should have children after search"
         );
 
         // Check that actions were expanded
-        if let Some(child) = root_after.children.values().next() {
-            match child {
-                MCTSNode::Chance(chance_node) => {
-                    let new_piece = chance_node.state.get_current_piece();
+        let first_child = root_after.children().next();
+        if let Some((_, chance_node)) = first_child {
+            let new_piece = chance_node.state.get_current_piece();
 
-                    // The current piece should have changed (old piece was placed, new one spawned)
-                    if let Some(ref new_p) = new_piece {
-                        assert_ne!(
-                            new_p.piece_type, initial_piece,
-                            "Current piece should have changed after placing"
-                        );
-                    }
+            // The current piece should have changed (old piece was placed, new one spawned)
+            if let Some(ref new_p) = new_piece {
+                assert_ne!(
+                    new_p.piece_type, initial_piece,
+                    "Current piece should have changed after placing"
+                );
+            }
 
-                    // The first piece from the old queue should now be current
-                    if let Some(ref new_p) = new_piece {
-                        assert_eq!(
-                            new_p.piece_type, initial_queue[0],
-                            "New current piece should be the first from old queue"
-                        );
-                    }
-                }
-                _ => panic!("First child should be a ChanceNode"),
+            // The first piece from the old queue should now be current
+            if let Some(ref new_p) = new_piece {
+                assert_eq!(
+                    new_p.piece_type, initial_queue[0],
+                    "New current piece should be the first from old queue"
+                );
             }
         }
     }

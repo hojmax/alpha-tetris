@@ -770,7 +770,6 @@ def train_warm_start_model(
         model,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
-        adamw_foreach=True,
     )
     ema = ExponentialMovingAverage(model, ema_decay) if ema_decay > 0.0 else None
     loss_balancer = RunningLossBalancer(value_loss_window)

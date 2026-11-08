@@ -16,7 +16,7 @@ pub use crate::game::action_space::{
 
 pub use agent::MCTSAgent;
 pub use config::MCTSConfig;
-pub use nodes::{get_valid_action_indices, ChanceNode, DecisionNode, MCTSNode};
+pub use nodes::{get_valid_action_indices, ChanceNode, ChanceOutcomes, DecisionNode};
 pub(crate) use persistence::{persist_saved_game_tree_playback, SavedGameTreePlayback};
 pub use results::{
     GameResult, GameStats, GameTreePlayback, GameTreeStats, GameTreeStep, MCTSResult,

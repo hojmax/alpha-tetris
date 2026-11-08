@@ -105,7 +105,6 @@ def benchmark_batch_size(
         model,
         learning_rate=0.0005,
         weight_decay=1e-4,
-        adamw_foreach=True,
     )
     model.train()
 

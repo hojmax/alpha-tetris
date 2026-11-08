@@ -130,6 +130,13 @@ def test_shutdown_after_training_stops_generator_and_finishes_wandb(
         lambda: calls.append("finish"),
     )
 
+    # Resumed run: offsets restored from the checkpoint, generator counters
+    # seeded by the replay preload (baseline) must not be counted twice.
+    trainer._cumulative_games_offset = 100
+    trainer._cumulative_examples_offset = 1_000
+    trainer._generator_games_baseline = 10
+    trainer._generator_examples_baseline = 30
+
     stop_error = trainer._shutdown_after_training(
         generator=generator,
         export_model=trainer.model,
@@ -139,7 +146,23 @@ def test_shutdown_after_training_stops_generator_and_finishes_wandb(
 
     assert stop_error is None
     assert calls == ["stop", "flush_async", "save", "artifact", "finish", "cleanup"]
-    assert saved_state["extra_checkpoint_state"] == {
+    extra_checkpoint_state = saved_state["extra_checkpoint_state"]
+    assert isinstance(extra_checkpoint_state, dict)
+    assert {
+        key: extra_checkpoint_state[key]
+        for key in (
+            "incumbent_uses_network",
+            "incumbent_model_step",
+            "incumbent_nn_value_weight",
+            "incumbent_death_penalty",
+            "incumbent_overhang_penalty_weight",
+            "incumbent_eval_avg_attack",
+            "incumbent_model_source_path",
+            "incumbent_model_artifact",
+            "cumulative_games_generated",
+            "cumulative_examples_generated",
+        )
+    } == {
         "incumbent_uses_network": False,
         "incumbent_model_step": 56,
         "incumbent_nn_value_weight": 0.3,
@@ -148,4 +171,6 @@ def test_shutdown_after_training_stops_generator_and_finishes_wandb(
         "incumbent_eval_avg_attack": 9.5,
         "incumbent_model_source_path": "/tmp/bootstrap.onnx",
         "incumbent_model_artifact": None,
+        "cumulative_games_generated": 102,
+        "cumulative_examples_generated": 1_004,
     }
