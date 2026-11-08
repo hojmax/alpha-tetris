@@ -41,8 +41,8 @@ self_play:
   visit_sampling_epsilon: 0.2
   mcts_seed: 0
   reuse_tree: true
-  count_reused_visits: false
-  min_new_simulations: 0
+  count_reused_visits: true  # visit budget: reused-root visits count toward num_simulations
+  min_new_simulations: 50  # same 10% floor as the measured 2000/200 setting
   num_workers: 32
   max_placements: 50
   penalty_schedule:
@@ -64,7 +64,7 @@ self_play:
   bootstrap_num_simulations: 4000
   save_eval_trees: false
 replay:
-  buffer_size: 3250000
+  buffer_size: 10000000
   min_buffer_size: 10000
   prefetch_batches: 1
   staged_batch_cache_batches: 1
