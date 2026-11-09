@@ -77,8 +77,7 @@ impl TetrisEnv {
         self.pieces_spawned += 1;
 
         self.clear_lock_delay();
-        self.last_move_was_rotation = false;
-        self.last_kick_index = 0;
+        self.spin_flag = false;
 
         let is_valid = self.is_valid_position_for(&piece);
         self.current_piece = Some(piece);
@@ -93,8 +92,7 @@ impl TetrisEnv {
         let piece = Piece::spawn(piece_type, self.width);
 
         self.clear_lock_delay();
-        self.last_move_was_rotation = false;
-        self.last_kick_index = 0;
+        self.spin_flag = false;
 
         let is_valid = self.is_valid_position_for(&piece);
         self.current_piece = Some(piece);

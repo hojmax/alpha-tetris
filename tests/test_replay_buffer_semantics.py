@@ -473,21 +473,18 @@ def _resolved_attack_for_transition(
         )
         combo_attack = _combo_attack(combo_before)
 
-    difficult_or_pc = (
-        bool(result.is_perfect_clear)
-        or bool(result.is_tspin)
-        or int(result.lines_cleared) == 4
-    )
+    if bool(result.is_perfect_clear):
+        # Jstris: a perfect clear replaces the clear's attack and B2B bonus; combo still adds.
+        return 10 + combo_attack
+
+    is_mini_single = bool(result.is_mini_tspin) and int(result.lines_cleared) == 1
+    receives_back_to_back_bonus = (bool(result.is_tspin) and not is_mini_single) or int(
+        result.lines_cleared
+    ) == 4
     back_to_back_attack = (
-        1 if bool(data["back_to_back"][index]) and difficult_or_pc else 0
+        1 if bool(data["back_to_back"][index]) and receives_back_to_back_bonus else 0
     )
-    perfect_clear_attack = 10 if bool(result.is_perfect_clear) else 0
-    return (
-        int(result.base_attack)
-        + combo_attack
-        + back_to_back_attack
-        + perfect_clear_attack
-    )
+    return int(result.base_attack) + combo_attack + back_to_back_attack
 
 
 def _expected_next_combo_feature(

@@ -153,6 +153,9 @@ class TetrisGame:
                 elif event.key == pygame.K_a:
                     self.env.rotate_ccw()
 
+                elif event.key == pygame.K_w:
+                    self.env.rotate_180()
+
                 elif event.key == pygame.K_SPACE:
                     self.env.hard_drop()
                     self.fall_time = 0
