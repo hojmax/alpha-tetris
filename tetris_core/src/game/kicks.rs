@@ -1,85 +1,107 @@
-//! SRS (Super Rotation System) Wall Kick Data
+//! Wall kick data, matching Jstris's SRS block set.
 //!
-//! This module contains the wall kick offset data used in the SRS rotation system.
-//! Wall kicks allow pieces to "kick" off walls and other pieces when rotating,
-//! making rotations feel more intuitive and enabling advanced techniques like T-spins.
+//! The 90° kicks are standard SRS. Jstris also has a 180° rotation whose kick list is the
+//! in-place rotation plus a single one-cell shift.
 //!
 //! Rotation states:
 //! - 0: Spawn state
 //! - 1: R (clockwise from spawn)
 //! - 2: 180° (two rotations from spawn)
 //! - 3: L (counter-clockwise from spawn)
+//!
+//! Offsets are `(dx, dy)` with y pointing down (positive = down), tried in order.
 
-/// SRS Wall kick data for J, L, S, T, Z pieces
-/// Note: y is inverted (positive = down in our coordinate system)
-/// Returns 5 kick offsets to try in order: (dx, dy)
-pub fn get_jlstz_kicks(from_state: usize, to_state: usize) -> [(i32, i32); 5] {
-    match (from_state, to_state) {
-        // 0->R (clockwise from spawn)
-        (0, 1) => [(0, 0), (-1, 0), (-1, -1), (0, 2), (-1, 2)],
-        // R->0 (counter-clockwise from R)
-        (1, 0) => [(0, 0), (1, 0), (1, 1), (0, -2), (1, -2)],
-        // R->2 (clockwise from R)
-        (1, 2) => [(0, 0), (1, 0), (1, 1), (0, -2), (1, -2)],
-        // 2->R (counter-clockwise from 2)
-        (2, 1) => [(0, 0), (-1, 0), (-1, -1), (0, 2), (-1, 2)],
-        // 2->L (clockwise from 2)
-        (2, 3) => [(0, 0), (1, 0), (1, -1), (0, 2), (1, 2)],
-        // L->2 (counter-clockwise from L)
-        (3, 2) => [(0, 0), (-1, 0), (-1, 1), (0, -2), (-1, -2)],
-        // L->0 (clockwise from L)
-        (3, 0) => [(0, 0), (-1, 0), (-1, 1), (0, -2), (-1, -2)],
-        // 0->L (counter-clockwise from spawn)
-        (0, 3) => [(0, 0), (1, 0), (1, -1), (0, 2), (1, 2)],
-        _ => panic!(
-            "Invalid JLSTZ kick transition: {} -> {}. Expected adjacent CW/CCW rotation states.",
-            from_state, to_state
-        ),
+use crate::game::constants::{I_PIECE, O_PIECE};
+
+/// A rotation input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rotation {
+    Clockwise,
+    CounterClockwise,
+    Half,
+}
+
+impl Rotation {
+    pub const ALL: [Rotation; 3] = [
+        Rotation::Clockwise,
+        Rotation::CounterClockwise,
+        Rotation::Half,
+    ];
+
+    /// Rotation state reached by applying this rotation to `from_state`.
+    #[inline]
+    pub fn target(self, from_state: usize) -> usize {
+        match self {
+            Rotation::Clockwise => (from_state + 1) % 4,
+            Rotation::CounterClockwise => (from_state + 3) % 4,
+            Rotation::Half => (from_state + 2) % 4,
+        }
     }
 }
 
-/// SRS Wall kick data for I piece
-/// The I piece has different kick data than other pieces
-pub fn get_i_kicks(from_state: usize, to_state: usize) -> [(i32, i32); 5] {
-    match (from_state, to_state) {
-        // 0->R
-        (0, 1) => [(0, 0), (-2, 0), (1, 0), (-2, 1), (1, -2)],
-        // R->0
-        (1, 0) => [(0, 0), (2, 0), (-1, 0), (2, -1), (-1, 2)],
-        // R->2
-        (1, 2) => [(0, 0), (-1, 0), (2, 0), (-1, -2), (2, 1)],
-        // 2->R
-        (2, 1) => [(0, 0), (1, 0), (-2, 0), (1, 2), (-2, -1)],
-        // 2->L
-        (2, 3) => [(0, 0), (2, 0), (-1, 0), (2, -1), (-1, 2)],
-        // L->2
-        (3, 2) => [(0, 0), (-2, 0), (1, 0), (-2, 1), (1, -2)],
-        // L->0
-        (3, 0) => [(0, 0), (1, 0), (-2, 0), (1, 2), (-2, -1)],
-        // 0->L
-        (0, 3) => [(0, 0), (-1, 0), (2, 0), (-1, -2), (2, 1)],
-        _ => panic!(
-            "Invalid I kick transition: {} -> {}. Expected adjacent CW/CCW rotation states.",
-            from_state, to_state
-        ),
-    }
-}
+type KickList5 = [(i32, i32); 5];
 
-/// Get the appropriate wall kicks for a piece type
+/// J, L, S, T, Z clockwise kicks, indexed by the starting rotation state.
+const JLSTZ_CLOCKWISE: [KickList5; 4] = [
+    [(0, 0), (-1, 0), (-1, -1), (0, 2), (-1, 2)],  // 0 -> R
+    [(0, 0), (1, 0), (1, 1), (0, -2), (1, -2)],    // R -> 2
+    [(0, 0), (1, 0), (1, -1), (0, 2), (1, 2)],     // 2 -> L
+    [(0, 0), (-1, 0), (-1, 1), (0, -2), (-1, -2)], // L -> 0
+];
+
+/// J, L, S, T, Z counter-clockwise kicks, indexed by the starting rotation state.
+const JLSTZ_COUNTER_CLOCKWISE: [KickList5; 4] = [
+    [(0, 0), (1, 0), (1, -1), (0, 2), (1, 2)],     // 0 -> L
+    [(0, 0), (1, 0), (1, 1), (0, -2), (1, -2)],    // R -> 0
+    [(0, 0), (-1, 0), (-1, -1), (0, 2), (-1, 2)],  // 2 -> R
+    [(0, 0), (-1, 0), (-1, 1), (0, -2), (-1, -2)], // L -> 2
+];
+
+/// I clockwise kicks, indexed by the starting rotation state.
+const I_CLOCKWISE: [KickList5; 4] = [
+    [(0, 0), (-2, 0), (1, 0), (-2, 1), (1, -2)], // 0 -> R
+    [(0, 0), (-1, 0), (2, 0), (-1, -2), (2, 1)], // R -> 2
+    [(0, 0), (2, 0), (-1, 0), (2, -1), (-1, 2)], // 2 -> L
+    [(0, 0), (1, 0), (-2, 0), (1, 2), (-2, -1)], // L -> 0
+];
+
+/// I counter-clockwise kicks, indexed by the starting rotation state.
+const I_COUNTER_CLOCKWISE: [KickList5; 4] = [
+    [(0, 0), (-1, 0), (2, 0), (-1, -2), (2, 1)], // 0 -> L
+    [(0, 0), (2, 0), (-1, 0), (2, -1), (-1, 2)], // R -> 0
+    [(0, 0), (1, 0), (-2, 0), (1, 2), (-2, -1)], // 2 -> R
+    [(0, 0), (-2, 0), (1, 0), (-2, 1), (1, -2)], // L -> 2
+];
+
+/// Jstris 180° kicks for every rotating piece (I included), indexed by the starting state.
+const HALF_TURN: [[(i32, i32); 2]; 4] = [
+    [(0, 0), (0, -1)], // 0 -> 2: up one
+    [(0, 0), (1, 0)],  // R -> L: right one
+    [(0, 0), (0, 1)],  // 2 -> 0: down one
+    [(0, 0), (-1, 0)], // L -> R: left one
+];
+
+const NO_KICK: [(i32, i32); 1] = [(0, 0)];
+
+/// Kick offsets to try, in order, when rotating `piece_type` from `from_state`.
 /// piece_type: 0=I, 1=O, 2=T, 3=S, 4=Z, 5=J, 6=L
-pub fn get_kicks_for_piece(
+pub fn get_kicks(
     piece_type: usize,
     from_state: usize,
-    to_state: usize,
-) -> [(i32, i32); 5] {
-    match piece_type {
-        0 => get_i_kicks(from_state, to_state),
-        1 => [(0, 0), (0, 0), (0, 0), (0, 0), (0, 0)], // O piece: no kicks needed
-        2..=6 => get_jlstz_kicks(from_state, to_state),
-        _ => panic!(
-            "Invalid piece_type for kicks: {}. Expected 0..=6.",
-            piece_type
-        ),
+    rotation: Rotation,
+) -> &'static [(i32, i32)] {
+    assert!(
+        from_state < 4,
+        "Invalid rotation state for kicks: {from_state}. Expected 0..=3."
+    );
+    match (piece_type, rotation) {
+        (O_PIECE, _) => &NO_KICK,
+        (0..=6, Rotation::Half) => &HALF_TURN[from_state],
+        (I_PIECE, Rotation::Clockwise) => &I_CLOCKWISE[from_state],
+        (I_PIECE, Rotation::CounterClockwise) => &I_COUNTER_CLOCKWISE[from_state],
+        (2..=6, Rotation::Clockwise) => &JLSTZ_CLOCKWISE[from_state],
+        (2..=6, Rotation::CounterClockwise) => &JLSTZ_COUNTER_CLOCKWISE[from_state],
+        _ => panic!("Invalid piece_type for kicks: {piece_type}. Expected 0..=6."),
     }
 }
 
@@ -87,194 +109,104 @@ pub fn get_kicks_for_piece(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_jlstz_kicks_first_is_identity() {
-        // First kick should always be (0, 0) - try without offset first
-        let transitions = [
-            (0, 1),
-            (1, 0),
-            (1, 2),
-            (2, 1),
-            (2, 3),
-            (3, 2),
-            (3, 0),
-            (0, 3),
-        ];
-        for (from, to) in transitions.iter() {
-            let kicks = get_jlstz_kicks(*from, *to);
-            assert_eq!(
-                kicks[0],
-                (0, 0),
-                "First kick for {}->{} should be (0,0)",
-                from,
-                to
-            );
-        }
-    }
+    type JstrisKicks = [[&'static [(i32, i32)]; 3]; 4];
 
-    #[test]
-    fn test_i_kicks_first_is_identity() {
-        let transitions = [
-            (0, 1),
-            (1, 0),
-            (1, 2),
-            (2, 1),
-            (2, 3),
-            (3, 2),
-            (3, 0),
-            (0, 3),
-        ];
-        for (from, to) in transitions.iter() {
-            let kicks = get_i_kicks(*from, *to);
-            assert_eq!(
-                kicks[0],
-                (0, 0),
-                "First I-kick for {}->{} should be (0,0)",
-                from,
-                to
-            );
-        }
-    }
+    /// Jstris's own SRS kick tables (y pointing up), indexed `[from_state][cw, ccw, 180]`,
+    /// copied from its client's `getBlockSets`.
+    const JSTRIS_JLSTZ: JstrisKicks = [
+        [
+            &[(0, 0), (-1, 0), (-1, 1), (0, -2), (-1, -2)],
+            &[(0, 0), (1, 0), (1, 1), (0, -2), (1, -2)],
+            &[(0, 0), (0, 1)],
+        ],
+        [
+            &[(0, 0), (1, 0), (1, -1), (0, 2), (1, 2)],
+            &[(0, 0), (1, 0), (1, -1), (0, 2), (1, 2)],
+            &[(0, 0), (1, 0)],
+        ],
+        [
+            &[(0, 0), (1, 0), (1, 1), (0, -2), (1, -2)],
+            &[(0, 0), (-1, 0), (-1, 1), (0, -2), (-1, -2)],
+            &[(0, 0), (0, -1)],
+        ],
+        [
+            &[(0, 0), (-1, 0), (-1, -1), (0, 2), (-1, 2)],
+            &[(0, 0), (-1, 0), (-1, -1), (0, 2), (-1, 2)],
+            &[(0, 0), (-1, 0)],
+        ],
+    ];
 
-    #[test]
-    fn test_o_kicks_all_identity() {
-        // O piece kicks are all identity (no kicks needed)
-        for from in 0..4 {
-            for to in 0..4 {
-                let kicks = get_kicks_for_piece(1, from, to); // 1 = O piece
-                for kick in kicks.iter() {
-                    assert_eq!(*kick, (0, 0));
-                }
+    const JSTRIS_I: JstrisKicks = [
+        [
+            &[(0, 0), (-2, 0), (1, 0), (-2, -1), (1, 2)],
+            &[(0, 0), (-1, 0), (2, 0), (-1, 2), (2, -1)],
+            &[(0, 0), (0, 1)],
+        ],
+        [
+            &[(0, 0), (-1, 0), (2, 0), (-1, 2), (2, -1)],
+            &[(0, 0), (2, 0), (-1, 0), (2, 1), (-1, -2)],
+            &[(0, 0), (1, 0)],
+        ],
+        [
+            &[(0, 0), (2, 0), (-1, 0), (2, 1), (-1, -2)],
+            &[(0, 0), (1, 0), (-2, 0), (1, -2), (-2, 1)],
+            &[(0, 0), (0, -1)],
+        ],
+        [
+            &[(0, 0), (1, 0), (-2, 0), (1, -2), (-2, 1)],
+            &[(0, 0), (-2, 0), (1, 0), (-2, -1), (1, 2)],
+            &[(0, 0), (-1, 0)],
+        ],
+    ];
+
+    fn assert_matches_jstris(piece_type: usize, jstris: &JstrisKicks) {
+        for (from_state, by_rotation) in jstris.iter().enumerate() {
+            for (rotation, expected_y_up) in Rotation::ALL.iter().zip(by_rotation) {
+                let expected: Vec<(i32, i32)> =
+                    expected_y_up.iter().map(|&(dx, dy)| (dx, -dy)).collect();
+                assert_eq!(
+                    get_kicks(piece_type, from_state, *rotation),
+                    expected.as_slice(),
+                    "piece {piece_type} from {from_state} {rotation:?}"
+                );
             }
         }
     }
 
     #[test]
-    fn test_kicks_length() {
-        let kicks = get_jlstz_kicks(0, 1);
-        assert_eq!(kicks.len(), 5);
-
-        let kicks = get_i_kicks(0, 1);
-        assert_eq!(kicks.len(), 5);
-    }
-
-    #[test]
-    fn test_get_kicks_for_piece() {
-        // I piece should use I kicks
-        let i_kicks = get_kicks_for_piece(0, 0, 1);
-        assert_eq!(i_kicks, get_i_kicks(0, 1));
-
-        // O piece should return all identity kicks (no kicks needed)
-        let o_kicks = get_kicks_for_piece(1, 0, 1);
-        assert_eq!(o_kicks, [(0, 0), (0, 0), (0, 0), (0, 0), (0, 0)]);
-
-        // T, S, Z, J, L should use JLSTZ kicks
-        for piece_type in 2..7 {
-            let kicks = get_kicks_for_piece(piece_type, 0, 1);
-            assert_eq!(kicks, get_jlstz_kicks(0, 1));
+    fn test_kicks_match_jstris_tables() {
+        assert_matches_jstris(I_PIECE, &JSTRIS_I);
+        for piece_type in 2..=6 {
+            assert_matches_jstris(piece_type, &JSTRIS_JLSTZ);
         }
     }
 
     #[test]
-    #[should_panic(expected = "Invalid JLSTZ kick transition")]
-    fn test_jlstz_invalid_transition_panics_same_state() {
-        let _ = get_jlstz_kicks(0, 0);
+    fn test_o_piece_never_kicks() {
+        for from_state in 0..4 {
+            for rotation in Rotation::ALL {
+                assert_eq!(get_kicks(O_PIECE, from_state, rotation), &[(0, 0)]);
+            }
+        }
     }
 
     #[test]
-    #[should_panic(expected = "Invalid JLSTZ kick transition")]
-    fn test_jlstz_invalid_transition_panics_skipped_state() {
-        let _ = get_jlstz_kicks(0, 2);
-    }
-
-    #[test]
-    #[should_panic(expected = "Invalid I kick transition")]
-    fn test_i_invalid_transition_panics() {
-        let _ = get_i_kicks(3, 1);
+    fn test_rotation_targets() {
+        assert_eq!(Rotation::Clockwise.target(3), 0);
+        assert_eq!(Rotation::CounterClockwise.target(0), 3);
+        assert_eq!(Rotation::Half.target(1), 3);
+        assert_eq!(Rotation::Half.target(3), 1);
     }
 
     #[test]
     #[should_panic(expected = "Invalid piece_type for kicks")]
-    fn test_get_kicks_for_piece_invalid_piece_type_panics() {
-        let _ = get_kicks_for_piece(7, 0, 1);
+    fn test_invalid_piece_type_panics() {
+        let _ = get_kicks(7, 0, Rotation::Clockwise);
     }
 
     #[test]
-    fn test_i_kicks_are_different_from_jlstz() {
-        // I piece kicks should be different from JLSTZ kicks
-        let i_kicks = get_i_kicks(0, 1);
-        let jlstz_kicks = get_jlstz_kicks(0, 1);
-
-        // At least one kick (besides the first identity) should be different
-        let mut found_difference = false;
-        for i in 1..5 {
-            if i_kicks[i] != jlstz_kicks[i] {
-                found_difference = true;
-                break;
-            }
-        }
-        assert!(found_difference, "I kicks should differ from JLSTZ kicks");
-    }
-
-    #[test]
-    fn test_symmetric_transitions() {
-        // Test that CW and CCW kicks are properly symmetric
-        // 0->1 (CW) should be inverse-related to 1->0 (CCW)
-        let cw_kicks = get_jlstz_kicks(0, 1);
-        let ccw_kicks = get_jlstz_kicks(1, 0);
-
-        // The kicks exist and have correct length
-        assert_eq!(cw_kicks.len(), 5);
-        assert_eq!(ccw_kicks.len(), 5);
-    }
-
-    #[test]
-    fn test_all_valid_jlstz_transitions() {
-        // All valid single-step transitions should have proper kicks
-        let valid_transitions = [
-            (0, 1),
-            (1, 0), // 0 <-> R
-            (1, 2),
-            (2, 1), // R <-> 2
-            (2, 3),
-            (3, 2), // 2 <-> L
-            (3, 0),
-            (0, 3), // L <-> 0
-        ];
-
-        for (from, to) in valid_transitions.iter() {
-            let kicks = get_jlstz_kicks(*from, *to);
-            // Should have non-trivial kicks (not all zeros after first)
-            let has_non_trivial = kicks[1..].iter().any(|&(x, y)| x != 0 || y != 0);
-            assert!(
-                has_non_trivial,
-                "Transition {}->{} should have non-trivial kicks",
-                from, to
-            );
-        }
-    }
-
-    #[test]
-    fn test_all_valid_i_transitions() {
-        let valid_transitions = [
-            (0, 1),
-            (1, 0),
-            (1, 2),
-            (2, 1),
-            (2, 3),
-            (3, 2),
-            (3, 0),
-            (0, 3),
-        ];
-
-        for (from, to) in valid_transitions.iter() {
-            let kicks = get_i_kicks(*from, *to);
-            let has_non_trivial = kicks[1..].iter().any(|&(x, y)| x != 0 || y != 0);
-            assert!(
-                has_non_trivial,
-                "I transition {}->{} should have non-trivial kicks",
-                from, to
-            );
-        }
+    #[should_panic(expected = "Invalid rotation state for kicks")]
+    fn test_invalid_rotation_state_panics() {
+        let _ = get_kicks(2, 4, Rotation::Clockwise);
     }
 }

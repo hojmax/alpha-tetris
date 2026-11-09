@@ -64,8 +64,8 @@ pub struct TetrisEnv {
     pub(crate) lock_delay_ms: Option<u32>,
     pub(crate) lock_delay_max: u32,
     pub(crate) lock_moves_remaining: u32,
-    pub(crate) last_move_was_rotation: bool,
-    pub(crate) last_kick_index: usize,
+    /// Jstris `spinPossible`: a rotation happened since the piece last moved down.
+    pub(crate) spin_flag: bool,
     pub(crate) last_attack_result: Option<AttackResult>,
     pub(crate) pieces_spawned: u32,
     pub(crate) current_piece_bag_position: u32,
@@ -108,8 +108,7 @@ impl TetrisEnv {
             lock_delay_ms: None,
             lock_delay_max: DEFAULT_LOCK_DELAY_MS,
             lock_moves_remaining: DEFAULT_LOCK_MOVES,
-            last_move_was_rotation: false,
-            last_kick_index: 0,
+            spin_flag: false,
             last_attack_result: None,
             pieces_spawned: 0,
             current_piece_bag_position: 0,
@@ -142,8 +141,7 @@ impl TetrisEnv {
         self.hold_used = false;
         self.lock_delay_ms = None;
         self.lock_moves_remaining = DEFAULT_LOCK_MOVES;
-        self.last_move_was_rotation = false;
-        self.last_kick_index = 0;
+        self.spin_flag = false;
         self.last_attack_result = None;
         self.pieces_spawned = 0;
         self.current_piece_bag_position = 0;
@@ -179,8 +177,7 @@ impl TetrisEnv {
             lock_delay_ms: self.lock_delay_ms,
             lock_delay_max: self.lock_delay_max,
             lock_moves_remaining: self.lock_moves_remaining,
-            last_move_was_rotation: self.last_move_was_rotation,
-            last_kick_index: self.last_kick_index,
+            spin_flag: self.spin_flag,
             last_attack_result: self.last_attack_result.clone(),
             pieces_spawned: self.pieces_spawned,
             current_piece_bag_position: self.current_piece_bag_position,

@@ -8,7 +8,8 @@ mod tests {
         Z_PIECE,
     };
     use crate::game::env::TetrisEnv;
-    use crate::game::piece::Piece;
+    use crate::game::piece::{get_cells, Piece};
+    use std::collections::{HashMap, HashSet, VecDeque};
 
     const HANDCRAFTED_TSPIN_BOARD: [&str; 20] = [
         "..........",
@@ -135,7 +136,7 @@ mod tests {
         if rotated {
             let new_rotation = env.current_piece.as_ref().unwrap().rotation;
             assert_eq!(new_rotation, (initial_rotation + 1) % 4);
-            assert!(env.last_move_was_rotation);
+            assert!(env.spin_flag);
         }
     }
 
@@ -149,18 +150,41 @@ mod tests {
         if rotated {
             let new_rotation = env.current_piece.as_ref().unwrap().rotation;
             assert_eq!(new_rotation, (initial_rotation + 3) % 4);
-            assert!(env.last_move_was_rotation);
+            assert!(env.spin_flag);
         }
     }
 
     #[test]
-    fn test_movement_clears_rotation_flag() {
+    fn test_sideways_moves_keep_spin_flag_and_down_moves_clear_it() {
+        // Jstris clears the spin flag only when the piece moves down.
         let mut env = TetrisEnv::new(10, 20);
         env.move_down();
-        env.rotate_cw();
-        assert!(env.last_move_was_rotation);
-        env.move_left();
-        assert!(!env.last_move_was_rotation);
+        assert!(env.rotate_cw());
+        assert!(env.spin_flag);
+        assert!(env.move_left());
+        assert!(env.spin_flag, "a sideways move keeps a pending spin");
+        assert!(env.move_down());
+        assert!(!env.spin_flag);
+
+        assert!(env.rotate_ccw());
+        assert!(env.hard_drop() > 0);
+        assert!(!env.spin_flag, "a hard drop that moves the piece clears it");
+    }
+
+    #[test]
+    fn test_rotate_180() {
+        let mut env = TetrisEnv::new(10, 20);
+        env.spawn_piece_from_type(T_PIECE);
+        env.move_down();
+        env.move_down();
+        let before = env.current_piece.clone().unwrap();
+        assert!(env.rotate_180());
+        let after = env.current_piece.as_ref().unwrap();
+        assert_eq!(after.rotation, 2);
+        assert_eq!((after.x, after.y), (before.x, before.y));
+        assert!(env.spin_flag);
+        assert_eq!(env.step(8), (0, false));
+        assert_eq!(env.current_piece.as_ref().unwrap().rotation, 0);
     }
 
     #[test]
@@ -528,8 +552,7 @@ mod tests {
         let mut env = TetrisEnv::new(10, 20);
         let piece = Piece::with_position(0, 3, 10, 0); // I piece
         env.current_piece = Some(piece);
-        env.last_move_was_rotation = true;
-        env.last_kick_index = 0;
+        env.spin_flag = true;
 
         let (is_tspin, _) = env.check_tspin(env.current_piece.as_ref().unwrap());
         assert!(!is_tspin);
@@ -540,7 +563,7 @@ mod tests {
         let mut env = TetrisEnv::new(10, 20);
         let piece = Piece::with_position(T_PIECE, 3, 10, 0);
         env.current_piece = Some(piece);
-        env.last_move_was_rotation = false;
+        env.spin_flag = false;
 
         let (is_tspin, _) = env.check_tspin(env.current_piece.as_ref().unwrap());
         assert!(!is_tspin);
@@ -561,40 +584,6 @@ mod tests {
     }
 
     // ==================== Board Collision Tests ====================
-
-    #[test]
-    fn test_is_cell_filled_empty_board() {
-        let env = TetrisEnv::new(10, 20);
-        // All cells should be empty
-        for y in 0..20 {
-            for x in 0..10 {
-                assert!(
-                    !env.is_cell_filled(x, y),
-                    "Cell ({}, {}) should be empty",
-                    x,
-                    y
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_is_cell_filled_out_of_bounds() {
-        let env = TetrisEnv::new(10, 20);
-        // Out of bounds should return true (filled)
-        assert!(env.is_cell_filled(-1, 10)); // left of board
-        assert!(env.is_cell_filled(10, 10)); // right of board
-        assert!(env.is_cell_filled(5, -1)); // above board
-        assert!(env.is_cell_filled(5, 20)); // below board
-    }
-
-    #[test]
-    fn test_is_cell_filled_with_piece() {
-        let mut env = TetrisEnv::new(10, 20);
-        env.board[19 * env.width + 5] = 1;
-        assert!(env.is_cell_filled(5, 19));
-        assert!(!env.is_cell_filled(4, 19));
-    }
 
     #[test]
     fn test_is_valid_position_empty_board() {
@@ -658,8 +647,7 @@ mod tests {
 
         let piece = Piece::with_position(T_PIECE, 4, 18, 0);
         env.current_piece = Some(piece.clone());
-        env.last_move_was_rotation = true;
-        env.last_kick_index = 0;
+        env.spin_flag = true;
 
         let (is_tspin, _) = env.check_tspin(&piece);
         // With 3 corners filled and both front corners filled, should be full T-spin
@@ -677,30 +665,11 @@ mod tests {
 
         let piece = Piece::with_position(T_PIECE, 4, 18, 0);
         env.current_piece = Some(piece.clone());
-        env.last_move_was_rotation = true;
-        env.last_kick_index = 0;
+        env.spin_flag = true;
 
         let (is_tspin, is_mini) = env.check_tspin(&piece);
         assert!(is_tspin, "Should detect T-spin");
         assert!(is_mini, "Should be a T-spin mini with only 1 front corner");
-    }
-
-    #[test]
-    fn test_tspin_kick_4_makes_full_tspin() {
-        let mut env = TetrisEnv::new(10, 20);
-        // With kick index 4 (the special SRS kick), even mini becomes full
-        env.board[18 * env.width + 4] = 1;
-        env.board[19 * env.width + 4] = 1;
-        env.board[19 * env.width + 6] = 1;
-
-        let piece = Piece::with_position(T_PIECE, 4, 18, 0);
-        env.current_piece = Some(piece.clone());
-        env.last_move_was_rotation = true;
-        env.last_kick_index = 4; // Special kick that makes it a full T-spin
-
-        let (is_tspin, is_mini) = env.check_tspin(&piece);
-        assert!(is_tspin, "Should detect T-spin");
-        assert!(!is_mini, "Kick index 4 should make it a full T-spin");
     }
 
     #[test]
@@ -715,8 +684,7 @@ mod tests {
 
         let piece = Piece::with_position(T_PIECE, 4, 10, 0);
         env.current_piece = Some(piece.clone());
-        env.last_move_was_rotation = true;
-        env.last_kick_index = 0;
+        env.spin_flag = true;
 
         let (is_tspin, _) = env.check_tspin(&piece);
         assert!(!is_tspin, "Should not be T-spin with only 2 corners");
@@ -733,8 +701,7 @@ mod tests {
 
         let piece = Piece::with_position(T_PIECE, 4, 18, 1);
         env.current_piece = Some(piece.clone());
-        env.last_move_was_rotation = true;
-        env.last_kick_index = 0;
+        env.spin_flag = true;
 
         let (is_tspin, is_mini) = env.check_tspin(&piece);
         assert!(is_tspin, "Should detect T-spin in rotation 1");
@@ -772,7 +739,7 @@ mod tests {
         let drop_distance = env.hard_drop();
 
         // Piece is already grounded after the final twist. Keeping drop distance 0 is important:
-        // hard_drop only clears last_move_was_rotation when it moves the piece down.
+        // hard_drop only clears spin_flag when it moves the piece down.
         assert_eq!(drop_distance, 0);
         let attack_delta = env.attack - attack_before_lock;
 
@@ -808,7 +775,7 @@ mod tests {
 
         // Same board, but rotation=0 has only one filled front corner at lock.
         // That should classify as a mini single (base 0 attack).
-        let attack_delta = env.place_piece_internal_with_kick(2, 17, 0, true, 0);
+        let attack_delta = env.place_piece_internal(2, 17, 0, true);
 
         assert_eq!(attack_delta, 0);
         assert_eq!(env.attack, 0);
@@ -837,12 +804,13 @@ mod tests {
     }
 
     #[test]
-    fn test_tspin_mini_double_attack() {
+    fn test_tspin_mini_double_scores_as_tspin_double() {
         let mut env = TetrisEnv::new(10, 20);
         // Vertical T (rotation 1, pointing right) against the left wall, center at (0, 18).
         // Back corners are the wall, the bottom-right front corner is filled and the
         // top-right front corner is open, so this is a mini that clears rows 18 and 19.
-        // The overhang matters: a T that could move up is not counted as a T-spin.
+        // Nothing stops it moving up; Jstris has no immobility check, and it scores
+        // mini doubles as full T-spin doubles.
         let rows = [
             "..........",
             "..........",
@@ -860,7 +828,7 @@ mod tests {
             "..........",
             "..........",
             "..........",
-            "X.........", // overhang so the piece cannot move up
+            "..........",
             "..........",
             "..XXXXXXXX",
             ".XXXXXXXXX",
@@ -868,7 +836,7 @@ mod tests {
         set_board_from_ascii(&mut env, &rows);
         env.spawn_piece_from_type(T_PIECE);
 
-        let attack_delta = env.place_piece_internal_with_kick(-1, 17, 1, true, 0);
+        let attack_delta = env.place_piece_internal(-1, 17, 1, true);
 
         assert_eq!(env.lines_cleared, 2);
         let result = env
@@ -877,8 +845,8 @@ mod tests {
             .expect("T-spin mini double should produce an attack result");
         assert!(result.is_tspin);
         assert!(result.is_mini_tspin);
-        assert_eq!(result.base_attack, 1);
-        assert_eq!(attack_delta, 1);
+        assert_eq!(result.base_attack, 4);
+        assert_eq!(attack_delta, 4);
         assert!(result.back_to_back_active);
     }
 
@@ -911,14 +879,14 @@ mod tests {
             }
 
             assert!(
-                placement.last_move_was_rotation,
-                "T-spin placement selected by MCTS should end on a rotation input"
+                placement.spin_flag,
+                "T-spin placement selected by MCTS should lock with the spin flag set"
             );
             assert!(
                 placement
                     .moves
                     .iter()
-                    .any(|&action| action == 4 || action == 5),
+                    .any(|&action| matches!(action, 4 | 5 | 8)),
                 "T-spin placement path should include at least one rotation action"
             );
             assert_eq!(result.total_attack, 4);
@@ -1130,6 +1098,152 @@ mod tests {
         assert!(result.is_perfect_clear);
     }
 
+    #[test]
+    fn test_perfect_clear_keeps_combo_bonus() {
+        // Jstris replaces the clear's attack and B2B bonus with 10 but still adds combo.
+        let mut env = TetrisEnv::new(10, 20);
+        env.back_to_back = true;
+        env.combo = 5;
+
+        for y in 16..20 {
+            for x in 0..10 {
+                env.board[y * env.width + x] = 1;
+            }
+        }
+        env.sync_board_stats();
+        env.clear_lines_internal(false, false);
+
+        let result = env.last_attack_result.as_ref().unwrap();
+        assert_eq!(result.base_attack, 0);
+        assert_eq!(result.back_to_back_attack, 0);
+        assert_eq!(result.combo_attack, 2);
+        assert_eq!(result.perfect_clear_attack, 10);
+        assert_eq!(result.total_attack, 12);
+        assert_eq!(env.attack, 12);
+        assert!(env.back_to_back);
+    }
+
+    #[test]
+    fn test_tspin_mini_single_with_back_to_back_gets_no_bonus() {
+        let mut env = TetrisEnv::new(10, 20);
+        env.back_to_back = true;
+        for x in 0..10 {
+            env.board[19 * env.width + x] = 1;
+        }
+        env.board[18 * env.width] = 1;
+        env.sync_board_stats();
+        env.clear_lines_internal(true, true);
+
+        let result = env.last_attack_result.as_ref().unwrap();
+        assert_eq!(result.total_attack, 0);
+        assert_eq!(result.back_to_back_attack, 0);
+        assert!(env.back_to_back, "a mini single keeps the chain");
+    }
+
+    /// Dense garbage with a T-shaped slot carved out, so spin geometries are common.
+    fn carved_slot_board(rng: &mut rand::rngs::StdRng) -> TetrisEnv {
+        use rand::Rng;
+        let mut env = TetrisEnv::new(10, 20);
+        let rows = rng.gen_range(3..=8);
+        for y in (20 - rows)..20 {
+            for x in 0..10 {
+                if rng.gen_bool(0.85) {
+                    env.board[y * env.width + x] = 1;
+                }
+            }
+        }
+        let rotation = rng.gen_range(0..4);
+        let slot_x = rng.gen_range(-1..=8);
+        let slot_y = rng.gen_range((19 - rows as i32)..=18);
+        for (x, y) in get_cells(T_PIECE, rotation, slot_x, slot_y) {
+            if (0..10).contains(&x) && (0..20).contains(&y) {
+                env.board[y as usize * env.width + x as usize] = 0;
+            }
+        }
+        for y in 0..20 {
+            let row = &mut env.board[y * 10..(y + 1) * 10];
+            if row.iter().all(|&cell| cell != 0) {
+                row[rng.gen_range(0..10)] = 0;
+            }
+        }
+        env.sync_board_stats();
+        env
+    }
+
+    /// Best `(attack, back_to_back)` any interactive input path achieves when the current
+    /// piece locks at each reachable final position.
+    fn best_lock_outcomes(env: &TetrisEnv) -> HashMap<(i32, i32, usize), (u32, bool)> {
+        let node = |e: &TetrisEnv| {
+            let p = e.current_piece.as_ref().unwrap();
+            (p.x, p.y, p.rotation, e.spin_flag)
+        };
+        let mut best = HashMap::new();
+        let mut seen = HashSet::from([node(env)]);
+        let mut queue = VecDeque::from([env.clone_state()]);
+        while let Some(state) = queue.pop_front() {
+            let piece = state.current_piece.clone().unwrap();
+            if !state.is_valid_position(piece.piece_type, piece.rotation, piece.x, piece.y + 1) {
+                let mut locked = state.clone_state();
+                let before = locked.attack;
+                locked.hard_drop();
+                let outcome = (locked.attack - before, locked.back_to_back);
+                let entry = best
+                    .entry((piece.x, piece.y, piece.rotation))
+                    .or_insert(outcome);
+                *entry = (*entry).max(outcome);
+            }
+            for input in [1u8, 2, 3, 4, 5, 8] {
+                let mut next = state.clone_state();
+                let moved = match input {
+                    1 => next.move_left(),
+                    2 => next.move_right(),
+                    3 => next.move_down(),
+                    4 => next.rotate_cw(),
+                    5 => next.rotate_ccw(),
+                    _ => next.rotate_180(),
+                };
+                if moved && seen.insert(node(&next)) {
+                    queue.push_back(next);
+                }
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn test_placements_match_best_input_path_for_t_pieces() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let mut tspins = 0;
+        for _ in 0..300 {
+            let mut env = carved_slot_board(&mut rng);
+            env.back_to_back = true;
+            env.spawn_piece_from_type(T_PIECE);
+            if env.game_over {
+                continue;
+            }
+            let best = best_lock_outcomes(&env);
+            let placements = env.get_possible_placements();
+            assert_eq!(placements.len(), best.len());
+            for placement in placements {
+                let mut sim = env.clone_state();
+                let before = sim.attack;
+                sim.execute_placement(&placement);
+                let outcome = (sim.attack - before, sim.back_to_back);
+                let key = (
+                    placement.piece.x,
+                    placement.piece.y,
+                    placement.piece.rotation,
+                );
+                assert_eq!(Some(&outcome), best.get(&key), "{placement:?}");
+                if sim.last_attack_result.as_ref().is_some_and(|r| r.is_tspin) {
+                    tspins += 1;
+                }
+            }
+        }
+        assert!(tspins >= 20, "boards should exercise T-spins, saw {tspins}");
+    }
+
     // ==================== Movement Tests ====================
 
     #[test]
@@ -1201,19 +1315,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rotation_tracks_last_kick_index() {
-        let mut env = TetrisEnv::new(10, 20);
-        env.move_down();
-        env.move_down();
-
-        // Rotate piece
-        if env.rotate_cw() {
-            // Kick index should be set (likely 0 for no-kick rotation)
-            assert!(env.last_kick_index < 5, "Kick index should be 0-4");
-        }
-    }
-
-    #[test]
     fn test_rotation_with_wall_kick() {
         let mut env = TetrisEnv::new(10, 20);
         // Move I-piece to right wall
@@ -1235,7 +1336,7 @@ mod tests {
             let piece = env.current_piece.as_ref().unwrap();
             // Rotation should have succeeded, possibly with a kick
             assert_ne!(piece.rotation, initial_rotation);
-            assert!(env.last_move_was_rotation);
+            assert!(env.spin_flag);
         }
     }
 
@@ -1246,8 +1347,9 @@ mod tests {
 
         assert!(!env.move_horizontal(-1));
         assert!(!env.move_horizontal(1));
-        assert!(!env.rotate(true));
-        assert!(!env.rotate(false));
+        assert!(!env.rotate_cw());
+        assert!(!env.rotate_ccw());
+        assert!(!env.rotate_180());
     }
 
     // ==================== Additional Edge Case Tests ====================
@@ -1555,7 +1657,7 @@ mod tests {
 
         // O piece shape has cells at rows 1-2, cols 1-2 of the 4x4 grid
         // So at y=17, cells are at y=18 and y=19 (valid)
-        env.place_piece_internal_with_kick(4, 17, 0, false, 0);
+        env.place_piece_internal(4, 17, 0, false);
 
         // Piece should be locked, new piece spawned
         assert!(env.current_piece.is_some());
@@ -1569,7 +1671,7 @@ mod tests {
         let mut env = TetrisEnv::new(10, 20);
         env.game_over = true;
 
-        let attack = env.place_piece_internal_with_kick(3, 18, 0, false, 0);
+        let attack = env.place_piece_internal(3, 18, 0, false);
         assert_eq!(attack, 0, "Should return 0 attack when game over");
     }
 
@@ -1578,7 +1680,7 @@ mod tests {
         let mut env = TetrisEnv::new(10, 20);
 
         // Try to place at invalid position (outside board)
-        let attack = env.place_piece_internal_with_kick(-5, 18, 0, false, 0);
+        let attack = env.place_piece_internal(-5, 18, 0, false);
         assert_eq!(attack, 0, "Should return 0 for invalid position");
     }
 
@@ -1587,7 +1689,7 @@ mod tests {
         let mut env = TetrisEnv::new(10, 20);
         env.current_piece = None;
 
-        let attack = env.place_piece_internal_with_kick(3, 18, 0, false, 0);
+        let attack = env.place_piece_internal(3, 18, 0, false);
         assert_eq!(attack, 0, "Should return 0 when no current piece");
     }
 
@@ -1596,29 +1698,10 @@ mod tests {
         let mut env = TetrisEnv::new(10, 20);
 
         // Place with rotation flag set
-        env.place_piece_internal_with_kick(3, 18, 1, true, 0);
+        env.place_piece_internal(3, 18, 1, true);
 
         // The placement should work (assuming position is valid for rotated piece)
         // Main thing is it doesn't crash
-    }
-
-    #[test]
-    fn test_place_piece_internal_with_kick_index() {
-        let mut env = TetrisEnv::new(10, 20);
-        // Spawn T piece for T-spin testing
-        env.spawn_piece_from_type(T_PIECE);
-
-        // Set up a scenario where kick_index matters for T-spin
-        env.board[18 * env.width + 4] = 1;
-        env.board[19 * env.width + 4] = 1;
-        env.board[19 * env.width + 6] = 1;
-        env.sync_board_stats();
-
-        // Place with kick_index = 4 (special T-spin kick)
-        env.place_piece_internal_with_kick(4, 17, 0, true, 4);
-
-        // The last_kick_index should be set
-        // (Note: piece gets locked so we can't check it directly, but the attack should reflect it)
     }
 
     #[test]
@@ -1635,7 +1718,7 @@ mod tests {
 
         // Place I piece horizontally to complete the row
         // I piece at rotation 0 is horizontal: [1,1,1,1] at row 1 of the shape
-        let attack = env.place_piece_internal_with_kick(6, 18, 0, false, 0);
+        let attack = env.place_piece_internal(6, 18, 0, false);
 
         // Should have cleared a line and gotten attack
         assert!(
@@ -1660,7 +1743,7 @@ mod tests {
         env.sync_board_stats();
 
         // Try to place piece inside the stack (invalid)
-        let attack = env.place_piece_internal_with_kick(3, 16, 0, false, 0);
+        let attack = env.place_piece_internal(3, 16, 0, false);
         assert_eq!(attack, 0, "Should return 0 when colliding with stack");
     }
 
@@ -1673,7 +1756,7 @@ mod tests {
             // Use T piece which has distinct rotations
             env.spawn_piece_from_type(T_PIECE);
 
-            env.place_piece_internal_with_kick(4, 17, rotation, false, 0);
+            env.place_piece_internal(4, 17, rotation, false);
             // Should not panic and piece should be placed
             assert!(
                 env.current_piece.is_some(),
@@ -1681,18 +1764,6 @@ mod tests {
                 rotation
             );
         }
-    }
-
-    #[test]
-    fn test_place_piece_sets_last_move_was_rotation() {
-        let mut env = TetrisEnv::new(10, 20);
-        env.last_move_was_rotation = false;
-
-        // Place with was_rotation = true
-        env.place_piece_internal_with_kick(3, 18, 0, true, 0);
-
-        // New piece is spawned, but the T-spin detection should have used the flag
-        // We can't easily verify this without checking attack values in a T-spin setup
     }
 
     #[test]
@@ -1713,7 +1784,7 @@ mod tests {
         // Place I piece vertically to complete all 4 rows
         // I piece rotation 1 (vertical) has cells at column 2 of the 4x4 grid
         // So at x=7, cells are at 7+2=9, which completes the rows
-        let attack_delta = env.place_piece_internal_with_kick(7, 16, 1, false, 0);
+        let attack_delta = env.place_piece_internal(7, 16, 1, false);
 
         // Should return the attack gained (Tetris = 4 lines)
         assert!(attack_delta > 0, "Tetris should give attack");

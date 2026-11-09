@@ -2,12 +2,13 @@
 //!
 //! Horizontal movement and rotation (internal implementations).
 
-use crate::game::kicks::get_kicks_for_piece;
+use crate::game::kicks::{get_kicks, Rotation};
 
 use super::TetrisEnv;
 
 impl TetrisEnv {
-    /// Internal horizontal movement logic
+    /// Internal horizontal movement logic. Like Jstris, a sideways move keeps the spin
+    /// flag; only downward movement clears it.
     pub(crate) fn move_horizontal(&mut self, dx: i32) -> bool {
         if self.game_over {
             return false;
@@ -21,29 +22,21 @@ impl TetrisEnv {
                 if was_grounded && self.lock_delay_ms.is_some() {
                     self.reset_lock_delay();
                 }
-                self.last_move_was_rotation = false;
                 return true;
             }
         }
         false
     }
 
-    /// Internal rotation logic using SRS wall kicks
-    pub(crate) fn rotate(&mut self, clockwise: bool) -> bool {
+    /// Internal rotation logic using the Jstris SRS wall kicks
+    pub(crate) fn rotate(&mut self, rotation: Rotation) -> bool {
         if self.game_over {
             return false;
         }
         let was_grounded = self.is_grounded();
         if let Some(ref piece) = self.current_piece {
-            let from_state = piece.rotation;
-            let to_state = if clockwise {
-                (piece.rotation + 1) % 4
-            } else {
-                (piece.rotation + 3) % 4
-            };
-            let kicks = get_kicks_for_piece(piece.piece_type, from_state, to_state);
-
-            for (kick_idx, (dx, dy)) in kicks.iter().enumerate() {
+            let to_state = rotation.target(piece.rotation);
+            for &(dx, dy) in get_kicks(piece.piece_type, piece.rotation, rotation) {
                 let new_x = piece.x + dx;
                 let new_y = piece.y + dy;
                 if self.is_valid_position(piece.piece_type, to_state, new_x, new_y) {
@@ -55,8 +48,7 @@ impl TetrisEnv {
                     if was_grounded && self.lock_delay_ms.is_some() {
                         self.reset_lock_delay();
                     }
-                    self.last_move_was_rotation = true;
-                    self.last_kick_index = kick_idx;
+                    self.spin_flag = true;
                     return true;
                 }
             }

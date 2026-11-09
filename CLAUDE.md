@@ -148,8 +148,13 @@ Ownership split:
 ### Scoring Reminder
 
 - Attack baseline: single 0, double 1, triple 2, tetris 4.
-- T-spins, combo, back-to-back, perfect clear apply bonuses.
-- T-spin base attack: mini single 0, mini double 1, single 2, double 4, triple 6 (TETR.IO values). Minis count as difficult for back-to-back. Detection (`game/env/clearing.rs`) uses the 3-corner rule plus front corners, upgrades a 5th-kick rotation to full, and also rejects any T that could still move up (a non-guideline extra that only drops some vertical minis).
+- Rules follow Jstris's client code (`GameCore.checkTSpin` / `checkLineClears` / `rotateCurrentBlock`; decoded from a mirror of its `game.js`). Keep them in sync with Jstris, not TETR.IO or the guideline.
+- T-spin attack: mini single 0, single 2, double 4, triple 6. A mini double scores as a full TSD (4) and a mini triple as a TST. Back-to-back +1 applies to tetrises and T-spins; a mini single keeps or starts the chain but never gets the +1.
+- Perfect clear sends 10 in place of the clear's own attack and B2B bonus, plus the combo bonus. B2B afterwards follows the underlying clear.
+- T-spin detection (`game/tspin.rs`, shared by the env and move generation): 3-corner rule, full = both front corners + at least one back corner, mini = one front + both back. No immobility check and no kick-based upgrade. Walls and floor count as filled; cells above the board count as empty.
+- Spin flag (`spin_flag`, Jstris `spinPossible`): set by any rotation, cleared only by downward movement (soft drop, gravity, or a hard drop that moves the piece). Sideways moves keep it.
+- 180° rotation exists (`rotate_180`, `step(8)`, `Action::Rotate180`) with Jstris's kicks: one fallback shift (up from spawn, right from R, down from 2, left from L).
+- Move generation BFS runs over (position, spin flag) for T pieces and reports the spin path for a final position whenever its corners make it a T-spin, since a spin never scores worse under these rules.
 
 ## Important Defaults (TrainingConfig)
 

@@ -1,11 +1,14 @@
 //! Attack Scoring System
 //!
-//! Implements attack scoring with:
-//! - Line clear attacks (single, double, triple, tetris)
-//! - T-spin bonuses (mini, single, double, triple)
-//! - Combo system
-//! - Back-to-back bonus for consecutive difficult clears
-//! - Perfect clear override (flat 10 lines, B2B state follows the underlying clear)
+//! Follows Jstris's default attack rules (`GameCore.checkLineClears`):
+//! - Line clear attacks (single 0, double 1, triple 2, tetris 4)
+//! - T-spins: mini single 0, single 2, double 4, triple 6. A mini double is scored as a
+//!   full T-spin double, and a mini triple as a T-spin triple.
+//! - Combo table indexed by consecutive clears (first clear = combo 0)
+//! - Back-to-back +1 for consecutive difficult clears. A T-spin mini single keeps or starts
+//!   the chain but never receives the bonus.
+//! - Perfect clear: the clear's own attack and back-to-back bonus are replaced by 10, the
+//!   combo bonus is still added, and the B2B state follows the underlying clear
 
 use pyo3::prelude::*;
 
@@ -24,8 +27,6 @@ pub enum ClearType {
     Tetris,
     /// T-spin mini single (1 line with mini T-spin)
     TSpinMiniSingle,
-    /// T-spin mini double (2 lines with mini T-spin)
-    TSpinMiniDouble,
     /// T-spin single (1 line with T-spin)
     TSpinSingle,
     /// T-spin double (2 lines with T-spin)
@@ -41,11 +42,16 @@ impl ClearType {
             self,
             ClearType::Tetris
                 | ClearType::TSpinMiniSingle
-                | ClearType::TSpinMiniDouble
                 | ClearType::TSpinSingle
                 | ClearType::TSpinDouble
                 | ClearType::TSpinTriple
         )
+    }
+
+    /// Whether this clear adds the back-to-back bonus when a chain is active.
+    /// Jstris lets a T-spin mini single extend the chain without paying the bonus.
+    pub fn receives_back_to_back_bonus(&self) -> bool {
+        self.is_difficult() && *self != ClearType::TSpinMiniSingle
     }
 
     /// Get the base attack value for this clear type
@@ -57,7 +63,6 @@ impl ClearType {
             ClearType::Triple => 2,
             ClearType::Tetris => 4,
             ClearType::TSpinMiniSingle => 0,
-            ClearType::TSpinMiniDouble => 1,
             ClearType::TSpinSingle => 2,
             ClearType::TSpinDouble => 4,
             ClearType::TSpinTriple => 6,
@@ -77,7 +82,7 @@ pub fn combo_attack(combo: u32) -> u32 {
     }
 }
 
-/// Perfect clear attack value
+/// Perfect clear attack value (replaces the clear's own attack and B2B bonus; combo still adds)
 pub const PERFECT_CLEAR_ATTACK: u32 = 10;
 
 /// Back-to-back bonus attack value
@@ -100,7 +105,7 @@ pub struct AttackResult {
     /// Number of lines cleared
     #[pyo3(get)]
     pub lines_cleared: u32,
-    /// Attack contributed by the clear type after any perfect-clear override
+    /// Attack contributed by the clear type (0 on a perfect clear, which replaces it)
     #[pyo3(get)]
     pub base_attack: u32,
     /// Combo bonus attack
@@ -163,20 +168,20 @@ pub fn calculate_attack_breakdown(
     back_to_back_active: bool,
     is_perfect_clear: bool,
 ) -> AttackBreakdown {
+    let combo_attack = combo_attack(combo);
     if is_perfect_clear {
         return AttackBreakdown {
             base_attack: 0,
-            combo_attack: 0,
+            combo_attack,
             back_to_back_attack: 0,
             perfect_clear_attack: PERFECT_CLEAR_ATTACK,
-            total_attack: PERFECT_CLEAR_ATTACK,
+            total_attack: PERFECT_CLEAR_ATTACK + combo_attack,
             back_to_back_active: clear_type.is_difficult(),
         };
     }
 
     let base_attack = clear_type.base_attack();
-    let combo_attack = combo_attack(combo);
-    let back_to_back_attack = if back_to_back_active && clear_type.is_difficult() {
+    let back_to_back_attack = if back_to_back_active && clear_type.receives_back_to_back_bonus() {
         BACK_TO_BACK_BONUS
     } else {
         0
@@ -210,7 +215,8 @@ pub fn calculate_attack(
     (breakdown.total_attack, breakdown.back_to_back_active)
 }
 
-/// Determine the clear type based on lines cleared and T-spin status
+/// Determine the clear type based on lines cleared and T-spin status.
+/// Only single-line minis score differently from full T-spins (Jstris).
 pub fn determine_clear_type(lines_cleared: u32, is_tspin: bool, is_mini_tspin: bool) -> ClearType {
     match (lines_cleared, is_tspin, is_mini_tspin) {
         (0, _, _) => ClearType::None,
@@ -218,8 +224,7 @@ pub fn determine_clear_type(lines_cleared: u32, is_tspin: bool, is_mini_tspin: b
         (1, true, true) => ClearType::TSpinMiniSingle,
         (1, true, false) => ClearType::TSpinSingle,
         (2, false, _) => ClearType::Double,
-        (2, true, true) => ClearType::TSpinMiniDouble,
-        (2, true, false) => ClearType::TSpinDouble,
+        (2, true, _) => ClearType::TSpinDouble,
         (3, false, _) => ClearType::Triple,
         (3, true, _) => ClearType::TSpinTriple,
         (4, _, _) => ClearType::Tetris,
@@ -239,7 +244,6 @@ mod tests {
         assert_eq!(ClearType::Triple.base_attack(), 2);
         assert_eq!(ClearType::Tetris.base_attack(), 4);
         assert_eq!(ClearType::TSpinMiniSingle.base_attack(), 0);
-        assert_eq!(ClearType::TSpinMiniDouble.base_attack(), 1);
         assert_eq!(ClearType::TSpinSingle.base_attack(), 2);
         assert_eq!(ClearType::TSpinDouble.base_attack(), 4);
         assert_eq!(ClearType::TSpinTriple.base_attack(), 6);
@@ -253,7 +257,6 @@ mod tests {
         assert!(!ClearType::Triple.is_difficult());
         assert!(ClearType::Tetris.is_difficult());
         assert!(ClearType::TSpinMiniSingle.is_difficult());
-        assert!(ClearType::TSpinMiniDouble.is_difficult());
         assert!(ClearType::TSpinSingle.is_difficult());
         assert!(ClearType::TSpinDouble.is_difficult());
         assert!(ClearType::TSpinTriple.is_difficult());
@@ -293,10 +296,9 @@ mod tests {
         );
         assert_eq!(determine_clear_type(1, true, false), ClearType::TSpinSingle);
         assert_eq!(determine_clear_type(2, true, false), ClearType::TSpinDouble);
-        assert_eq!(
-            determine_clear_type(2, true, true),
-            ClearType::TSpinMiniDouble
-        );
+        // Jstris scores mini doubles and mini triples as full T-spins.
+        assert_eq!(determine_clear_type(2, true, true), ClearType::TSpinDouble);
+        assert_eq!(determine_clear_type(3, true, true), ClearType::TSpinTriple);
         assert_eq!(determine_clear_type(3, true, false), ClearType::TSpinTriple);
     }
 
@@ -360,6 +362,21 @@ mod tests {
     }
 
     #[test]
+    fn test_tspin_mini_single_keeps_back_to_back_without_bonus() {
+        let (attack, b2b) = calculate_attack(ClearType::TSpinMiniSingle, 0, true, false);
+        assert_eq!(attack, 0);
+        assert!(b2b);
+
+        let (attack, b2b) = calculate_attack(ClearType::TSpinMiniSingle, 0, false, false);
+        assert_eq!(attack, 0);
+        assert!(b2b, "a mini single starts a back-to-back chain");
+
+        // The next difficult clear still gets the bonus.
+        let (attack, _) = calculate_attack(ClearType::TSpinSingle, 0, true, false);
+        assert_eq!(attack, 3);
+    }
+
+    #[test]
     fn test_calculate_attack_combo() {
         // Tetris at combo 5 - 4 + 2 = 6 attack
         let (attack, _) = calculate_attack(ClearType::Tetris, 5, false, false);
@@ -372,7 +389,7 @@ mod tests {
 
     #[test]
     fn test_calculate_attack_perfect_clear() {
-        // Perfect clears are a flat 10 attack and B2B follows the underlying clear type.
+        // Perfect clears send 10 (plus combo) and B2B follows the underlying clear type.
         let (attack, b2b) = calculate_attack(ClearType::Tetris, 0, false, true);
         assert_eq!(attack, 10);
         assert!(b2b);
@@ -390,9 +407,9 @@ mod tests {
 
     #[test]
     fn test_calculate_attack_combined() {
-        // Perfect clear overrides combo and B2B attack bonuses as well.
+        // A perfect clear drops the B2B bonus but keeps the combo bonus (combo 5 -> +2).
         let (attack, b2b) = calculate_attack(ClearType::Tetris, 5, true, true);
-        assert_eq!(attack, 10);
+        assert_eq!(attack, 12);
         assert!(b2b);
     }
 
@@ -401,10 +418,10 @@ mod tests {
         let breakdown = calculate_attack_breakdown(ClearType::TSpinDouble, 7, true, true);
 
         assert_eq!(breakdown.base_attack, 0);
-        assert_eq!(breakdown.combo_attack, 0);
+        assert_eq!(breakdown.combo_attack, 3);
         assert_eq!(breakdown.back_to_back_attack, 0);
         assert_eq!(breakdown.perfect_clear_attack, 10);
-        assert_eq!(breakdown.total_attack, 10);
+        assert_eq!(breakdown.total_attack, 13);
         assert!(breakdown.back_to_back_active);
     }
 

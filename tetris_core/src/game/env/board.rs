@@ -52,14 +52,6 @@ impl TetrisEnv {
         true
     }
 
-    /// Check if a cell is filled (occupied or out of bounds)
-    pub(crate) fn is_cell_filled(&self, x: i32, y: i32) -> bool {
-        if x < 0 || x >= self.width as i32 || y < 0 || y >= self.height as i32 {
-            return true;
-        }
-        self.board[y as usize * self.width + x as usize] != 0
-    }
-
     /// Check if the board is completely empty (perfect clear)
     /// O(1) using total_blocks counter
     pub(crate) fn is_perfect_clear(&self) -> bool {

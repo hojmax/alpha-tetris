@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::game::action_space::{HOLD_ACTION_INDEX, NUM_ACTIONS};
 use crate::game::constants::NUM_PIECE_TYPES;
+use crate::game::kicks::Rotation;
 use crate::game::moves::{find_all_placement_params, find_all_placements, Board, Placement};
 use crate::game::piece::{spawn_x, spawn_y, Piece};
 use crate::game::scoring::AttackResult;
@@ -283,8 +284,7 @@ impl TetrisEnv {
         if piece_type < 7 && !self.game_over {
             self.current_piece = Some(Piece::spawn(piece_type, self.width));
             self.clear_lock_delay();
-            self.last_move_was_rotation = false;
-            self.last_kick_index = 0;
+            self.spin_flag = false;
             self.invalidate_placement_cache();
         }
     }
@@ -351,7 +351,7 @@ impl TetrisEnv {
                 } else {
                     self.lock_delay_ms = None;
                 }
-                self.last_move_was_rotation = false;
+                self.spin_flag = false;
                 return true;
             }
         }
@@ -371,7 +371,7 @@ impl TetrisEnv {
                 let mut dropped = piece.clone();
                 dropped.y += dist;
                 self.current_piece = Some(dropped);
-                self.last_move_was_rotation = false;
+                self.spin_flag = false;
             }
             dist as u32
         } else {
@@ -382,11 +382,15 @@ impl TetrisEnv {
     }
 
     pub fn rotate_cw(&mut self) -> bool {
-        self.rotate(true)
+        self.rotate(Rotation::Clockwise)
     }
 
     pub fn rotate_ccw(&mut self) -> bool {
-        self.rotate(false)
+        self.rotate(Rotation::CounterClockwise)
+    }
+
+    pub fn rotate_180(&mut self) -> bool {
+        self.rotate(Rotation::Half)
     }
 
     pub fn step(&mut self, action: u8) -> (u32, bool) {
@@ -413,6 +417,9 @@ impl TetrisEnv {
             }
             7 => {
                 self.hold();
+            }
+            8 => {
+                self.rotate_180();
             }
             _ => {}
         }
@@ -445,7 +452,7 @@ impl TetrisEnv {
     // === Placement (placement.rs) ===
 
     pub fn place_piece(&mut self, x: i32, y: i32, rotation: usize) -> u32 {
-        self.place_piece_internal_with_kick(x, y, rotation, false, 0)
+        self.place_piece_internal(x, y, rotation, false)
     }
 
     pub fn execute_placement(&mut self, placement: &Placement) -> u32 {
@@ -453,13 +460,7 @@ impl TetrisEnv {
         let y = placement.piece.y;
         let rotation = placement.piece.rotation;
 
-        self.place_piece_internal_with_kick(
-            x,
-            y,
-            rotation,
-            placement.last_move_was_rotation,
-            placement.last_kick_index,
-        )
+        self.place_piece_internal(x, y, rotation, placement.spin_flag)
     }
 
     pub fn get_possible_placements(&self) -> Vec<Placement> {
@@ -494,16 +495,8 @@ impl TetrisEnv {
             return if self.hold() { Some(0) } else { None };
         }
 
-        let (x, y, rotation, last_move_was_rotation, last_kick_index) =
-            self.cached_placement_params_for_action(action_idx)?;
-
-        Some(self.place_piece_internal_with_kick(
-            x,
-            y,
-            rotation,
-            last_move_was_rotation,
-            last_kick_index,
-        ))
+        let (x, y, rotation, spin_flag) = self.cached_placement_params_for_action(action_idx)?;
+        Some(self.place_piece_internal(x, y, rotation, spin_flag))
     }
 }
 
@@ -563,15 +556,14 @@ impl TetrisEnv {
     fn cached_placement_params_for_action(
         &self,
         action_idx: usize,
-    ) -> Option<(i32, i32, usize, bool, usize)> {
+    ) -> Option<(i32, i32, usize, bool)> {
         self.with_placement_set(|placement_set| {
             let placement = placement_set.placement_for_action(action_idx)?;
             Some((
                 placement.x as i32,
                 placement.y as i32,
                 placement.rotation as usize,
-                placement.last_move_was_rotation,
-                placement.last_kick_index as usize,
+                placement.spin_flag,
             ))
         })
     }

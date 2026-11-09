@@ -2,68 +2,26 @@
 //!
 //! Locking pieces, clearing lines, and T-spin mechanics.
 
-use crate::game::constants::T_PIECE;
 use crate::game::piece::{get_cells, Piece};
 use crate::game::scoring::{calculate_attack_breakdown, determine_clear_type, AttackResult};
+use crate::game::tspin::{classify_tspin, TSpin};
 
 use super::TetrisEnv;
 
 impl TetrisEnv {
-    /// Check if the T piece at the given position has a T-spin
-    /// Returns (is_tspin, is_mini)
+    /// T-spin status of `piece` locking now, as `(is_tspin, is_mini)`.
     pub(crate) fn check_tspin(&self, piece: &Piece) -> (bool, bool) {
-        if piece.piece_type != T_PIECE {
-            return (false, false);
-        }
-
-        if !self.last_move_was_rotation {
-            return (false, false);
-        }
-
-        // If the piece could move up, it was reachable by hard drop — not a real T-spin
-        if self.is_valid_position(piece.piece_type, piece.rotation, piece.x, piece.y - 1) {
-            return (false, false);
-        }
-
-        let center_x = piece.x + 1;
-        let center_y = piece.y + 1;
-
-        let corners = [
-            (center_x - 1, center_y - 1),
-            (center_x + 1, center_y - 1),
-            (center_x - 1, center_y + 1),
-            (center_x + 1, center_y + 1),
-        ];
-
-        let mut filled_corners = 0;
-        for (cx, cy) in corners.iter() {
-            if self.is_cell_filled(*cx, *cy) {
-                filled_corners += 1;
-            }
-        }
-
-        if filled_corners < 3 {
-            return (false, false);
-        }
-
-        let front_corners = match piece.rotation {
-            0 => [(center_x - 1, center_y - 1), (center_x + 1, center_y - 1)],
-            1 => [(center_x + 1, center_y - 1), (center_x + 1, center_y + 1)],
-            2 => [(center_x - 1, center_y + 1), (center_x + 1, center_y + 1)],
-            3 => [(center_x - 1, center_y - 1), (center_x - 1, center_y + 1)],
-            _ => return (false, false),
-        };
-
-        let front_filled = front_corners
-            .iter()
-            .filter(|(cx, cy)| self.is_cell_filled(*cx, *cy))
-            .count();
-
-        if front_filled == 2 || self.last_kick_index == 4 {
-            (true, false)
-        } else {
-            (true, true)
-        }
+        let tspin = classify_tspin(
+            self.board_cells(),
+            self.width,
+            self.height,
+            piece.piece_type,
+            piece.x,
+            piece.y,
+            piece.rotation,
+            self.spin_flag,
+        );
+        (tspin.is_spin(), tspin == TSpin::Mini)
     }
 
     pub(crate) fn lock_piece_internal(&mut self) {

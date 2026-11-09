@@ -5,14 +5,14 @@
 use super::TetrisEnv;
 
 impl TetrisEnv {
-    /// Internal placement logic with explicit T-spin detection info
-    pub(crate) fn place_piece_internal_with_kick(
+    /// Lock the current piece at `(x, y, rotation)`. `spin_flag` says whether the path that
+    /// got it there rotated after its last downward move (needed for T-spin detection).
+    pub(crate) fn place_piece_internal(
         &mut self,
         x: i32,
         y: i32,
         rotation: usize,
-        was_rotation: bool,
-        kick_index: usize,
+        spin_flag: bool,
     ) -> u32 {
         if self.game_over {
             return 0;
@@ -33,8 +33,7 @@ impl TetrisEnv {
             new_piece.rotation = rotation;
             self.current_piece = Some(new_piece);
 
-            self.last_move_was_rotation = was_rotation;
-            self.last_kick_index = kick_index;
+            self.spin_flag = spin_flag;
 
             let old_attack = self.attack;
             self.lock_piece_internal();

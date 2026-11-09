@@ -23,7 +23,7 @@ pub mod search;
 // Re-export main types for convenience
 pub use game::constants::NUM_PIECE_TYPES;
 pub use game::env::TetrisEnv;
-pub use game::kicks::{get_i_kicks, get_jlstz_kicks, get_kicks_for_piece};
+pub use game::kicks::{get_kicks, Rotation};
 pub use game::moves::{find_all_placements, Action, Board, Placement};
 pub use game::piece::{get_cells, Piece, TETROMINOS, TETROMINO_CELLS};
 pub use game::scoring::{
