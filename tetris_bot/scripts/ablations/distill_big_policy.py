@@ -24,6 +24,7 @@ import structlog
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import wandb
 from simple_parsing import parse
 
 from tetris_bot.action_space import ACTION_TO_CANONICAL_FLAT_INDEX
@@ -58,7 +59,7 @@ CACHE_FIELDS = (
 
 @dataclass
 class ScriptArgs:
-    mode: str = "train"  # prepare | train | eval
+    mode: str = "train"  # prepare | train | eval | backfill (upload metrics.jsonl of --run_name)
     data_paths: list[str] = field(
         default_factory=list
     )  # npz (prepare) or cache dirs (train)
@@ -92,6 +93,7 @@ class ScriptArgs:
         ""  # eval mode: an incumbent .onnx played through the Rust predictor
     )
     eval_workers: int = 32
+    wandb_project: str = "tetris-big-policy"  # empty disables W&B
 
 
 # ---------------------------------------------------------------- data
@@ -407,6 +409,7 @@ def run_train(args: ScriptArgs) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "args.json").write_text(json.dumps(asdict(args), default=str, indent=1))
     metrics_file = (out_dir / "metrics.jsonl").open("a")
+    wandb_run = init_wandb(args, run_name, out_dir)
 
     ds = load_dataset(args.data_paths, args.val_game_mod, device)
     model = build_model(args).to(device)
@@ -446,6 +449,8 @@ def run_train(args: ScriptArgs) -> None:
         row.update(step=step, samples=samples, train_minutes=round(train_time / 60, 2))
         metrics_file.write(json.dumps(row) + "\n")
         metrics_file.flush()
+        if wandb_run is not None:
+            wandb_run.log(wandb_row(row), step=step)
         logger.info(
             "metrics",
             **{k: round(v, 4) if isinstance(v, float) else v for k, v in row.items()},
@@ -513,6 +518,50 @@ def run_train(args: ScriptArgs) -> None:
     )
     (out_dir / "final.json").write_text(json.dumps(final, indent=1))
     logger.info("Saved", path=str(out_dir / "model.pt"))
+    if wandb_run is not None:
+        wandb_run.finish()
+
+
+def init_wandb(args: ScriptArgs, run_name: str, out_dir: Path):
+    if not args.wandb_project:
+        return None
+    return wandb.init(
+        project=args.wandb_project,
+        name=run_name,
+        config=asdict(args),
+        dir=str(out_dir),
+    )
+
+
+def wandb_row(row: dict) -> dict:
+    """Group metrics so W&B shows game attack, val and train curves as separate panels."""
+    out = {}
+    for key, value in row.items():
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            continue
+        if key.startswith("attack") or key.startswith("game_"):
+            out[f"game/{key}"] = value
+        elif key.startswith("val_"):
+            out[f"val/{key[4:]}"] = value
+        else:
+            out[f"train/{key}"] = value
+    return out
+
+
+def run_backfill(args: ScriptArgs) -> None:
+    """Upload an existing run's metrics.jsonl to W&B (for runs started without logging)."""
+    run_dir = args.output_dir / args.run_name
+    saved_args = json.loads((run_dir / "args.json").read_text())
+    run = wandb.init(
+        project=args.wandb_project,
+        name=args.run_name,
+        config=saved_args,
+        dir=str(run_dir),
+    )
+    for line in (run_dir / "metrics.jsonl").read_text().splitlines():
+        row = json.loads(line)
+        run.log(wandb_row(row), step=row["step"])
+    run.finish()
 
 
 def run_eval(args: ScriptArgs) -> None:
@@ -549,7 +598,13 @@ def run_eval(args: ScriptArgs) -> None:
 
 
 def main(args: ScriptArgs) -> None:
-    {"prepare": run_prepare, "train": run_train, "eval": run_eval}[args.mode](args)
+    modes = {
+        "prepare": run_prepare,
+        "train": run_train,
+        "eval": run_eval,
+        "backfill": run_backfill,
+    }
+    modes[args.mode](args)
 
 
 if __name__ == "__main__":
