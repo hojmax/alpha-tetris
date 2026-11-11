@@ -682,6 +682,14 @@ def run_train(args: ScriptArgs) -> None:
     )
     model_params = list(model.parameters())
     ema_params = list(ema_model.parameters())
+
+    def sync_ema_buffers() -> None:
+        # The EMA averages parameters only; BatchNorm running stats must come from the live model.
+        for ema_buffer, buffer in zip(
+            ema_model.buffers(), model.buffers(), strict=True
+        ):
+            ema_buffer.copy_(buffer)
+
     train_step = compute_losses
     if args.compile and device.type == "cuda":
         train_step = torch.compile(compute_losses)
@@ -715,6 +723,7 @@ def run_train(args: ScriptArgs) -> None:
         )
 
     def save(path: Path, extra: dict) -> None:
+        sync_ema_buffers()
         torch.save(
             {
                 "model_state_dict": ema_model.state_dict(),
@@ -725,6 +734,7 @@ def run_train(args: ScriptArgs) -> None:
         )
 
     def game_eval(eval_seeds: list[int]) -> dict:
+        sync_ema_buffers()
         start = time.perf_counter()
         attacks = play_policy_games(ema_model, eval_seeds, args.max_placements, device)
         result: dict = summarize_attacks(attacks)
@@ -778,6 +788,7 @@ def run_train(args: ScriptArgs) -> None:
         if device.type == "cuda":
             row["gpu_mem_gb"] = torch.cuda.max_memory_allocated() / 1e9
         if train_time - last_val >= args.val_every_seconds:
+            sync_ema_buffers()
             row.update(validate(ema_model, ds))
             last_val = train_time
         if train_time - last_game_eval >= args.game_eval_every_minutes * 60:
@@ -797,6 +808,7 @@ def run_train(args: ScriptArgs) -> None:
         )
 
     save(out_dir / "final.pt", {"step": step})
+    sync_ema_buffers()
     final = {**validate(ema_model, ds), **game_eval(list(range(args.final_eval_seeds)))}
     final["final"] = True
     record(final)
