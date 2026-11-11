@@ -598,12 +598,18 @@ def compute_losses(
     policy_loss = -(policy * log_probs).sum(1).mean()
     # Cross-entropy minus target entropy: 0 means the policy matches the MCTS target exactly.
     target_entropy = -(policy * torch.log(policy.clamp_min(1e-12))).sum(1).mean()
-    value_loss = F.mse_loss(value_pred.float(), values)
+    value_pred = value_pred.float()
+    value_loss = F.mse_loss(value_pred, values)
+    # 1 = value explains all variance in the remaining-attack target, 0 = no better than its mean.
+    value_explained_variance = 1.0 - (
+        value_pred - values
+    ).var() / values.var().clamp_min(1e-8)
     top1 = (logits.argmax(1) == policy.argmax(1)).float().mean()
     return {
         "policy_loss": policy_loss,
         "policy_kl": policy_loss - target_entropy,
         "value_loss": value_loss,
+        "value_explained_variance": value_explained_variance,
         "top1": top1,
     }
 
