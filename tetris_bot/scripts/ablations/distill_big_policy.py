@@ -610,6 +610,8 @@ def compute_losses(
         "policy_kl": policy_loss - target_entropy,
         "value_loss": value_loss,
         "value_explained_variance": value_explained_variance,
+        # Typical miss in attack points (targets are remaining attack / VALUE_SCALE).
+        "value_rmse_attack": value_loss.sqrt() * VALUE_SCALE,
         "top1": top1,
     }
 
