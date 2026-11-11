@@ -92,6 +92,8 @@ class ScriptArgs:
     layers: int = 12
     heads: int = 6
     mlp_hidden: int = 1024
+    conv_stem_blocks: int = 4  # 0 = pure transformer over raw cells
+    conv_stem_channels: int = 128
     # resnet
     channels: int = 128
     blocks: int = 10
@@ -297,15 +299,43 @@ def _slice_width(s: slice) -> int:
     return s.stop - s.start
 
 
+class ConvStemBlock(nn.Module):
+    """Pre-norm residual 3x3 conv block; gives cell tokens a local-neighbourhood prior."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(8, channels)
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.norm2 = nn.GroupNorm(8, channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        nn.init.zeros_(self.conv2.weight)
+        nn.init.zeros_(self.conv2.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.conv1(F.silu(self.norm1(x)))
+        return x + self.conv2(F.silu(self.norm2(h)))
+
+
 class TransformerPolicyNet(nn.Module):
     """One token per board cell plus queue, current/hold piece, scalar, value and hold tokens.
 
+    With ``conv_stem_blocks > 0`` the cell tokens come from a residual 3x3 conv stack
+    over the board (local patterns: fits, slots, overhangs) and the transformer then
+    mixes them globally; with 0 each cell token is just filled/empty plus its position.
     Placement logits come from the cell tokens (4 rotations per cell, read at the
     canonical cell each action index maps to); the hold logit and value come from their
     own learned query tokens.
     """
 
-    def __init__(self, d_model: int, layers: int, heads: int, mlp_hidden: int):
+    def __init__(
+        self,
+        d_model: int,
+        layers: int,
+        heads: int,
+        mlp_hidden: int,
+        conv_stem_blocks: int,
+        conv_stem_channels: int,
+    ):
         super().__init__()
         layout = AUX_FEATURE_LAYOUT
         self.current_slice = layout.current_piece
@@ -315,6 +345,15 @@ class TransformerPolicyNet(nn.Module):
         self.register_buffer("aux_std", torch.ones(AUX_DIM))
 
         self.cell_filled = nn.Parameter(torch.zeros(d_model))
+        self.conv_stem: nn.Module | None = None
+        if conv_stem_blocks > 0:
+            self.conv_stem = nn.Sequential(
+                nn.Conv2d(1, conv_stem_channels, 3, padding=1),
+                *(ConvStemBlock(conv_stem_channels) for _ in range(conv_stem_blocks)),
+                nn.GroupNorm(8, conv_stem_channels),
+                nn.SiLU(),
+                nn.Conv2d(conv_stem_channels, d_model, 1),
+            )
         self.cell_pos = nn.Parameter(torch.zeros(NUM_CELLS, d_model))
         self.current_embed = nn.Linear(_slice_width(layout.current_piece), d_model)
         self.hold_embed = nn.Linear(_slice_width(layout.hold_piece), d_model)
@@ -356,6 +395,10 @@ class TransformerPolicyNet(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch = board.shape[0]
         cells = board.reshape(batch, NUM_CELLS, 1) * self.cell_filled + self.cell_pos
+        if self.conv_stem is not None:
+            # Walls are implicit in the zero padding, which reads as empty; the filled
+            # embedding and positions above still carry absolute location.
+            cells = cells + self.conv_stem(board).flatten(2).transpose(1, 2)
         queue = aux[:, self.queue_slice].reshape(batch, QUEUE_SIZE, -1)
         context = torch.stack(
             [
@@ -454,7 +497,12 @@ class BigPolicyNet(nn.Module):
 def build_model(config: dict) -> nn.Module:
     if config["arch"] == "transformer":
         return TransformerPolicyNet(
-            config["d_model"], config["layers"], config["heads"], config["mlp_hidden"]
+            config["d_model"],
+            config["layers"],
+            config["heads"],
+            config["mlp_hidden"],
+            config.get("conv_stem_blocks", 0),
+            config.get("conv_stem_channels", 128),
         )
     if config["arch"] == "resnet":
         return BigPolicyNet(
@@ -586,7 +634,9 @@ def pick_device() -> torch.device:
 def default_run_name(args: ScriptArgs) -> str:
     stamp = time.strftime("%Y%m%d-%H%M%S")
     if args.arch == "transformer":
-        return f"transformer_d{args.d_model}l{args.layers}_{stamp}"
+        return (
+            f"transformer_d{args.d_model}l{args.layers}c{args.conv_stem_blocks}_{stamp}"
+        )
     return f"resnet_c{args.channels}b{args.blocks}_{stamp}"
 
 
