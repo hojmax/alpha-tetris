@@ -23,7 +23,7 @@ I did two of the items from the list at the bottom of this README, then trained 
 
 ![](docs/attack_vs_search_depth.png)
 
-The new network is much stronger. Its raw policy (0 simulations) scores about what the original reaches with 400–800 simulations, and with deep search (3200–6400 simulations) the final model gets ~59–60 average attack against ~52–53. The labels on the top line give the time per move on one M5 Pro core.
+The new network is much stronger. Its raw policy (0 simulations) averages 50.9 attack, about what the original reaches with 800 simulations, and with deep search (3200–6400 simulations) the final model gets ~60 average attack against ~52–54. Each point is the run's final network averaged over 100 seeds; the labels on the top line give the time per move on one M5 Pro core.
 
 # Results
 
