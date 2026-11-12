@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-import numpy as np
 import structlog
 import torch
 import torch.nn as nn
@@ -30,6 +29,7 @@ from tetris_bot.scripts.ablations.compare_offline_architectures import (
     train_offline_model,
     validate_common_offline_args,
 )
+from tetris_bot.ml.replay_npz import open_replay_npz
 
 logger = structlog.get_logger()
 _DEFAULT_SELF_PLAY = load_training_config(DEFAULT_CONFIG_PATH).self_play
@@ -243,7 +243,7 @@ def main(args: ScriptArgs) -> None:
     wandb.define_metric("current/*", step_metric="offline_step")
     wandb.define_metric("deep_conv/*", step_metric="offline_step")
 
-    npz = np.load(args.data_path, mmap_mode="r")
+    npz = open_replay_npz(args.data_path, mmap_mode="r")
     try:
         setup = setup_offline_dataset(
             npz=npz,

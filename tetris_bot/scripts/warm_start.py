@@ -65,6 +65,7 @@ from tetris_bot.scripts.ablations.compare_offline_architectures import (
     tensor_dataset_bytes,
     validate_shapes,
 )
+from tetris_bot.ml.replay_npz import ReplayArchive, open_replay_npz
 
 logger = structlog.get_logger()
 _OPTIMIZE_CACHE_DIR = BENCHMARKS_DIR / "profiles" / "optimize_cache"
@@ -599,7 +600,7 @@ def has_better_eval_metric(
 
 
 def setup_offline_dataset(
-    npz: np.lib.npyio.NpzFile,
+    npz: ReplayArchive,
     *,
     seed: int,
     max_examples: int,
@@ -1320,7 +1321,7 @@ def run_warm_start(
     model = TetrisNet(**resolved_output_config.network.model_dump()).to(device)
 
     try:
-        npz = np.load(source_training_data_path, mmap_mode="r")
+        npz = open_replay_npz(source_training_data_path, mmap_mode="r")
         try:
             dataset_setup = setup_offline_dataset(
                 npz,

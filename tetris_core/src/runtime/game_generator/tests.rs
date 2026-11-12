@@ -114,11 +114,9 @@ fn test_snapshot_persister_shutdown_flushes_latest_pending_snapshot() {
     let snapshot_path = unique_temp_path("latest_snapshot").with_extension("npz");
     let persister = SnapshotPersister::new();
 
-    persister.submit_snapshot(
-        snapshot_path.clone(),
-        vec![make_example(1), make_example(2)],
-    );
-    persister.submit_snapshot(snapshot_path.clone(), vec![make_example(7)]);
+    let compact = |move_number| CompactExample::from_example(&make_example(move_number));
+    persister.submit_snapshot(snapshot_path.clone(), vec![compact(1), compact(2)]);
+    persister.submit_snapshot(snapshot_path.clone(), vec![compact(7)]);
     persister.shutdown();
 
     let loaded = read_examples_from_npz(&snapshot_path).expect("snapshot should load");

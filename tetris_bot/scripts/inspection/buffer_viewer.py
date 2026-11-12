@@ -34,6 +34,7 @@ from tetris_bot.constants import (
     QUEUE_SIZE,
 )
 from tetris_bot.scripts.inspection.value_predictor import ValuePredictor
+from tetris_bot.ml.replay_npz import open_replay_npz
 
 PIECE_CHARS = PIECE_NAMES
 PIECE_COLORS = ["cyan", "yellow", "magenta", "green", "red", "blue", "bright_red"]
@@ -61,7 +62,7 @@ def find_game_boundaries(move_numbers: np.ndarray) -> list[tuple[int, int]]:
 
 class BufferViewer:
     def __init__(self, data_path: Path, value_predictor: ValuePredictor | None):
-        self.data = np.load(data_path)
+        self.data = open_replay_npz(data_path)
         self.n_examples = len(self.data["boards"])
         self.move_numbers = self.data["move_numbers"]
         self.games = find_game_boundaries(self.move_numbers)

@@ -15,15 +15,25 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::game::constants::{AUX_FEATURES, BOARD_HEIGHT, BOARD_WIDTH, NUM_PIECE_TYPES};
+use crate::game::constants::{AUX_FEATURES, BOARD_HEIGHT, BOARD_WIDTH};
 use crate::game::env::TetrisEnv;
 use crate::search::GameStats;
-use crate::search::{
-    GameResult, GameTreeStats, MCTSAgent, MCTSConfig, TrainingExample, NUM_ACTIONS,
-};
+use crate::search::{GameResult, GameTreeStats, MCTSAgent, MCTSConfig, TrainingExample};
 
+use crate::replay::compact::{BOARD_BYTES, MASK_BYTES, POLICY_SLOTS};
 use crate::replay::npz::{read_examples_from_npz, write_examples_to_npz};
-use crate::replay::{GameReplay, ReplayMove};
+use crate::replay::{CompactExample, GameReplay, ReplayMove};
+
+/// `(board_bits, aux, policy_legal, values, overhang_fields, mask_bits)`; see
+/// `GameGenerator::examples_to_numpy`.
+type CompactNumpyBatch<'py> = (
+    &'py PyArray2<u8>,
+    &'py PyArray2<f32>,
+    &'py PyArray2<u16>,
+    &'py PyArray1<f32>,
+    &'py PyArray1<f32>,
+    &'py PyArray2<u8>,
+);
 
 mod py_api;
 mod runtime;

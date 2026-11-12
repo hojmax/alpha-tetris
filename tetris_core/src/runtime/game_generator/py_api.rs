@@ -217,7 +217,7 @@ impl GameGenerator {
                     .map(|example| example.game_number)
                     .max()
                     .expect("loaded_examples was checked as non-empty");
-                self.buffer.add_examples(loaded_examples);
+                self.buffer.add_compact_examples(loaded_examples);
                 let retained_examples_count = self.buffer.len();
                 let replay_end_index = self.buffer.window_end_index();
                 self.games_generated
@@ -716,51 +716,13 @@ impl GameGenerator {
         self.buffer.len()
     }
 
-    /// Snapshot the full replay buffer as numpy arrays plus the logical start index.
-    ///
-    /// The returned `start_index` is the global index (exclusive-end counter based)
-    /// of the first retained replay example in the current FIFO window.
-    ///
-    /// Returns None if the buffer is empty.
-    pub fn replay_buffer_snapshot<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<
-        Option<(
-            u64,
-            &'py PyArray2<f32>,
-            &'py PyArray2<f32>,
-            &'py PyArray2<f32>,
-            &'py PyArray1<f32>,
-            &'py PyArray1<f32>,
-            &'py PyArray2<f32>,
-        )>,
-    > {
-        let Some((start_index, _end_index, snapshot_examples)) =
-            self.buffer.logical_window_snapshot()
-        else {
-            return Ok(None);
-        };
-
-        let arrays = Self::examples_to_numpy(py, &snapshot_examples)?;
-        Ok(Some((
-            start_index,
-            arrays.0,
-            arrays.1,
-            arrays.2,
-            arrays.3,
-            arrays.4,
-            arrays.5,
-        )))
-    }
-
     /// Fetch a delta slice from the replay buffer's logical index space.
     ///
     /// Returns:
     /// - `window_start_index`: global index of current FIFO window start
     /// - `window_end_index`: global index one-past current FIFO window end
     /// - `slice_start_index`: global index of first returned example
-    /// - tensor arrays for up to `max_examples` examples in `[slice_start_index, window_end_index)`
+    /// - compact arrays (see `examples_to_numpy`) for up to `max_examples` examples in `[slice_start_index, window_end_index)`
     ///
     /// Returns None if the buffer is empty.
     #[pyo3(signature = (from_index, max_examples))]
@@ -769,19 +731,7 @@ impl GameGenerator {
         py: Python<'py>,
         from_index: u64,
         max_examples: usize,
-    ) -> PyResult<
-        Option<(
-            u64,
-            u64,
-            u64,
-            &'py PyArray2<f32>,
-            &'py PyArray2<f32>,
-            &'py PyArray2<f32>,
-            &'py PyArray1<f32>,
-            &'py PyArray1<f32>,
-            &'py PyArray2<f32>,
-        )>,
-    > {
+    ) -> PyResult<Option<(u64, u64, u64, CompactNumpyBatch<'py>)>> {
         if max_examples == 0 {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 "max_examples must be > 0",
@@ -795,17 +745,7 @@ impl GameGenerator {
         };
 
         let arrays = Self::examples_to_numpy(py, &slice_examples)?;
-        Ok(Some((
-            window_start,
-            window_end,
-            slice_start,
-            arrays.0,
-            arrays.1,
-            arrays.2,
-            arrays.3,
-            arrays.4,
-            arrays.5,
-        )))
+        Ok(Some((window_start, window_end, slice_start, arrays)))
     }
 
     /// Write a delta slice from the replay buffer directly to an NPZ file.
@@ -877,42 +817,22 @@ impl GameGenerator {
                 example.game_number = example.game_number.saturating_add(game_number_offset);
             }
         }
-        self.buffer.add_examples(examples);
+        self.buffer.add_compact_examples(examples);
         self.examples_generated
             .fetch_add(count as u64, Ordering::SeqCst);
         Ok(count)
     }
 
-    /// Sample a batch of training data from the replay buffer.
-    ///
-    /// Returns a tuple of numpy arrays:
-    /// (
-    ///   boards,
-    ///   aux_features,
-    ///   policy_targets,
-    ///   value_targets,
-    ///   overhang_fields,
-    ///   action_masks,
-    /// )
-    ///
-    /// Returns None if the buffer is empty.
+    /// Sample a uniform batch from the replay buffer as compact arrays (see
+    /// `examples_to_numpy`). Returns None if the buffer is empty.
     #[pyo3(signature = (batch_size))]
     pub fn sample_batch<'py>(
         &self,
         py: Python<'py>,
         batch_size: usize,
-    ) -> PyResult<
-        Option<(
-            &'py PyArray2<f32>,
-            &'py PyArray2<f32>,
-            &'py PyArray2<f32>,
-            &'py PyArray1<f32>,
-            &'py PyArray1<f32>,
-            &'py PyArray2<f32>,
-        )>,
-    > {
+    ) -> PyResult<Option<CompactNumpyBatch<'py>>> {
         // Snapshot sampled examples under lock, then release lock before heavy work.
-        let sampled_examples: Vec<TrainingExample> = {
+        let sampled_examples: Vec<CompactExample> = {
             let state = self.buffer.state.read().unwrap();
             let n = state.examples.len();
             if n == 0 {
@@ -928,9 +848,6 @@ impl GameGenerator {
                 })
                 .collect()
         };
-        let arrays = Self::examples_to_numpy(py, &sampled_examples)?;
-        Ok(Some((
-            arrays.0, arrays.1, arrays.2, arrays.3, arrays.4, arrays.5,
-        )))
+        Self::examples_to_numpy(py, &sampled_examples).map(Some)
     }
 }

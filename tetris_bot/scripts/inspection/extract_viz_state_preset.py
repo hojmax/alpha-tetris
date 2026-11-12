@@ -17,6 +17,7 @@ import structlog
 from simple_parsing import parse
 
 from tetris_bot.constants import PIECE_NAMES, PROJECT_ROOT
+from tetris_bot.ml.replay_npz import open_replay_npz
 
 logger = structlog.get_logger()
 
@@ -71,7 +72,7 @@ def main(args: ScriptArgs) -> None:
     if not args.data_path.exists():
         raise FileNotFoundError(f"NPZ not found: {args.data_path}")
 
-    with np.load(args.data_path) as data:
+    with open_replay_npz(args.data_path) as data:
         if "game_numbers" not in data:
             raise ValueError("NPZ missing required key: game_numbers")
         if "move_numbers" not in data:
