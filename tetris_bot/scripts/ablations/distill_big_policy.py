@@ -38,6 +38,7 @@ from tetris_bot.action_space import ACTION_TO_CANONICAL_FLAT_INDEX
 from tetris_bot.constants import BENCHMARKS_DIR, NUM_ACTIONS, QUEUE_SIZE
 from tetris_bot.ml.aux_features import AUX_FEATURE_LAYOUT
 from tetris_bot.ml.policy_mirroring import mirror_training_tensors
+from tetris_bot.ml.replay_npz import open_replay_npz
 from tetris_bot.scripts.ablations.compare_offline_architectures import (
     build_aux_batch_from_npz,
 )
@@ -137,7 +138,7 @@ class ScriptArgs:
 
 def prepare_cache(npz_path: Path, out_dir: Path, game_offset: int) -> None:
     torch.set_num_threads(16)
-    data = np.load(npz_path)
+    data = open_replay_npz(npz_path)
     n = data["boards"].shape[0]
     log = logger.bind(source=str(npz_path), examples=n)
     log.info("Preparing cache")
@@ -156,9 +157,12 @@ def prepare_cache(npz_path: Path, out_dir: Path, game_offset: int) -> None:
     masks = data["action_masks"]
     if masks.shape[1] != NUM_ACTIONS:
         raise ValueError(f"mask width {masks.shape[1]} != {NUM_ACTIONS}")
-    np.save(out_dir / "mask_bits.npy", np.packbits(masks, axis=1, bitorder="little"))
+    np.save(
+        out_dir / "mask_bits.npy",
+        np.packbits(np.asarray(masks, dtype=bool), axis=1, bitorder="little"),
+    )
     del masks
-    policy = torch.from_numpy(data["policy_targets"])
+    policy = torch.from_numpy(np.asarray(data["policy_targets"], dtype=np.float32))
     idx_out = np.empty((n, POLICY_TOPK), dtype=np.int16)
     val_out = np.empty((n, POLICY_TOPK), dtype=np.float16)
     lost_mass = 0.0
