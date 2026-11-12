@@ -1,0 +1,20 @@
+{
+ "val_policy_loss": 0.3064758011418871,
+ "val_policy_kl": 0.06372076646457461,
+ "val_value_loss": 0.03531303065913325,
+ "val_top1": 0.953762999973123,
+ "attack_seeds0_19": 48.8,
+ "attack_all": 51.79,
+ "attack_all_sem": 0.3800978484211327,
+ "attack_p10": 33.0,
+ "attack_p50": 56.0,
+ "attack_p90": 63.0,
+ "games": 1000,
+ "game_eval_seconds": 41.06946605537087,
+ "final": true,
+ "step": 44657,
+ "samples": 91457536,
+ "epoch": 18.665157522377466,
+ "train_minutes": 60.001,
+ "wall_minutes": 66.161
+}

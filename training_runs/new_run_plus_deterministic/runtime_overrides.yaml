@@ -1,0 +1,12 @@
+optimizer:
+  lr_multiplier: 1.0
+  grad_clip_norm: null
+  weight_decay: null
+  mirror_augmentation_probability: null
+run:
+  log_interval_seconds: null
+  checkpoint_interval_seconds: null
+self_play:
+  force_promote_next_candidate: false
+  add_noise: false
+  visit_sampling_epsilon: 0.0

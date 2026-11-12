@@ -5,7 +5,20 @@ tetris_core/tetris_core.cpython-*.pyd
 .env
 *.egg-info/
 __pycache__/
-training_runs/
+# Training runs: only the final models and their configs are tracked; replay
+# buffers (training_data*.npz), training checkpoints and other files stay local.
+training_runs/**
+!training_runs/**/
+!training_runs/*/config.yaml
+!training_runs/*/runtime_overrides.yaml
+!training_runs/drive_final/checkpoints/incumbent.*
+!training_runs/new_run/checkpoints/incumbent.*
+!training_runs/new_run_plus_deterministic/final_weights/sync_step_3505140.*
+!training_runs/no_search_resnet/final.pt
+!training_runs/no_search_resnet/final.json
+!training_runs/no_search_resnet/args.json
+!training_runs/no_search_resnet/metrics.jsonl
+!training_runs/no_search_resnet/train.log
 wandb/
 outputs/
 .build_marker_release
