@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+from tetris_bot.ml.replay_npz import open_replay_npz
 from simple_parsing import parse
 
 EXPECTED_NUM_ROWS = 4
@@ -21,7 +22,7 @@ def main(args: ScriptArgs) -> None:
     if args.data_path.suffix != ".npz":
         raise ValueError(f"expected .npz file, got: {args.data_path}")
 
-    with np.load(args.data_path, mmap_mode="r") as data:
+    with open_replay_npz(args.data_path, mmap_mode="r") as data:
         if "row_fill_counts" not in data:
             raise KeyError("missing required key: row_fill_counts")
         row_fill_counts = np.asarray(data["row_fill_counts"], dtype=np.float32)

@@ -3,7 +3,6 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-import numpy as np
 import structlog
 from simple_parsing import parse
 
@@ -18,6 +17,7 @@ from tetris_bot.scripts.inspection.inspect_training_data import (
     build_game_slices,
     get_piece_type,
 )
+from tetris_bot.ml.replay_npz import open_replay_npz
 
 logger = structlog.get_logger()
 
@@ -43,7 +43,7 @@ def main(args: ScriptArgs) -> None:
 
     args.save_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with np.load(args.data_path) as data:
+    with open_replay_npz(args.data_path) as data:
         n_examples = len(data["boards"])
         games = build_game_slices(data)
 

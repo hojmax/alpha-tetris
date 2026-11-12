@@ -49,6 +49,7 @@ from tetris_bot.constants import (
     PROJECT_ROOT,
     QUEUE_SIZE,
 )
+from tetris_bot.ml.replay_npz import ReplayArchive, open_replay_npz
 
 
 COLUMN_HEIGHT_NORMALIZATION_DIVISOR = 8.0
@@ -244,7 +245,7 @@ def _queue_from_one_hot(queue_row: np.ndarray) -> list[int]:
     return [int(np.argmax(slot)) for slot in queue_row]
 
 
-def _restore_env(data: dict[str, np.ndarray] | np.lib.npyio.NpzFile, index: int) -> Any:
+def _restore_env(data: dict[str, np.ndarray] | ReplayArchive, index: int) -> Any:
     env = tetris_core.TetrisEnv.with_seed(BOARD_WIDTH, BOARD_HEIGHT, 0)
     board = np.asarray(data["boards"][index], dtype=np.uint8)
     current_piece = _piece_type_from_one_hot(np.asarray(data["current_pieces"][index]))
@@ -360,7 +361,7 @@ def _policy_row(chosen_action: int, action_mask: np.ndarray) -> np.ndarray:
 
 
 def _stored_aux_vector(
-    data: dict[str, np.ndarray] | np.lib.npyio.NpzFile,
+    data: dict[str, np.ndarray] | ReplayArchive,
     index: int,
 ) -> np.ndarray:
     hold_available = np.array([float(data["hold_available"][index])], dtype=np.float32)
@@ -405,7 +406,7 @@ def _stored_aux_vector(
 
 
 def _network_aux_vector(
-    data: dict[str, np.ndarray] | np.lib.npyio.NpzFile,
+    data: dict[str, np.ndarray] | ReplayArchive,
     index: int,
 ) -> np.ndarray:
     return build_aux_features(
@@ -431,7 +432,7 @@ def _network_aux_vector(
 
 
 def _placement_index(
-    data: dict[str, np.ndarray] | np.lib.npyio.NpzFile,
+    data: dict[str, np.ndarray] | ReplayArchive,
     index: int,
     max_placements: int,
 ) -> int:
@@ -453,7 +454,7 @@ def _combo_attack(combo_before: int) -> int:
 
 
 def _resolved_attack_for_transition(
-    data: dict[str, np.ndarray] | np.lib.npyio.NpzFile,
+    data: dict[str, np.ndarray] | ReplayArchive,
     index: int,
     action_idx: int,
     env_after: Any,
@@ -488,7 +489,7 @@ def _resolved_attack_for_transition(
 
 
 def _expected_next_combo_feature(
-    data: dict[str, np.ndarray] | np.lib.npyio.NpzFile,
+    data: dict[str, np.ndarray] | ReplayArchive,
     index: int,
     action_idx: int,
     env_after: Any,
@@ -505,7 +506,7 @@ def _expected_next_combo_feature(
 
 
 def _expected_next_back_to_back(
-    data: dict[str, np.ndarray] | np.lib.npyio.NpzFile,
+    data: dict[str, np.ndarray] | ReplayArchive,
     index: int,
     action_idx: int,
     env_after: Any,
@@ -657,7 +658,7 @@ def _iter_game_segments(
     return [(int(start), int(end)) for start, end in zip(starts, ends)]
 
 
-def _infer_max_placements(data: dict[str, np.ndarray] | np.lib.npyio.NpzFile) -> int:
+def _infer_max_placements(data: dict[str, np.ndarray] | ReplayArchive) -> int:
     override = os.environ.get(REPLAY_BUFFER_MAX_PLACEMENTS_ENV_VAR)
     if override is not None:
         return int(override)
@@ -738,7 +739,7 @@ def _env_flag_enabled(name: str) -> bool:
 
 
 def _transition_matches(
-    data: dict[str, np.ndarray] | np.lib.npyio.NpzFile,
+    data: dict[str, np.ndarray] | ReplayArchive,
     index: int,
     action_idx: int,
     attack: int,
@@ -841,7 +842,7 @@ def _transition_matches(
 
 
 def validate_replay_buffer_semantics(
-    data: dict[str, np.ndarray] | np.lib.npyio.NpzFile,
+    data: dict[str, np.ndarray] | ReplayArchive,
     *,
     max_placements: int | None = None,
     pair_sample_limit: int | None = None,
@@ -1100,7 +1101,7 @@ def test_replay_buffer_semantics_on_tracked_fixture() -> None:
         validate_replay_buffer_semantics(data)
         return
 
-    with np.load(fixture_path, mmap_mode="r") as data:
+    with open_replay_npz(fixture_path, mmap_mode="r") as data:
         validate_replay_buffer_semantics(data)
 
 

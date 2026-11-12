@@ -32,6 +32,7 @@ from tetris_bot.scripts.ablations.compare_offline_architectures import (
     pick_device,
     validate_common_offline_args,
 )
+from tetris_bot.ml.replay_npz import ReplayArchive, open_replay_npz
 
 logger = structlog.get_logger()
 
@@ -164,7 +165,7 @@ class OfflineTensorDataset:
 
 @dataclass
 class OfflineDataSource:
-    npz: np.lib.npyio.NpzFile
+    npz: ReplayArchive
     selected_global_indices: np.ndarray
     tensor_data: OfflineTensorDataset | None
     included_groups: tuple[ExtraFeatureGroup, ...]
@@ -307,7 +308,7 @@ def validate_args(args: ScriptArgs) -> None:
 
 
 def ensure_required_keys(
-    data: np.lib.npyio.NpzFile,
+    data: ReplayArchive,
     extra_feature_groups: tuple[ExtraFeatureGroup, ...],
 ) -> None:
     required_keys: list[str] = list(REQUIRED_NPZ_BASE_KEYS)
@@ -318,7 +319,7 @@ def ensure_required_keys(
 
 
 def validate_shapes(
-    data: np.lib.npyio.NpzFile,
+    data: ReplayArchive,
     extra_feature_groups: tuple[ExtraFeatureGroup, ...],
 ) -> int:
     n = int(data["boards"].shape[0])
@@ -387,7 +388,7 @@ def validate_shapes(
 
 
 def build_base_aux_batch_from_npz(
-    data: np.lib.npyio.NpzFile,
+    data: ReplayArchive,
     global_indices: np.ndarray,
     current_pieces: np.ndarray | None = None,
 ) -> np.ndarray:
@@ -430,7 +431,7 @@ def build_base_aux_batch_from_npz(
 
 
 def build_extra_aux_batch_from_npz(
-    data: np.lib.npyio.NpzFile,
+    data: ReplayArchive,
     global_indices: np.ndarray,
     included_groups: tuple[ExtraFeatureGroup, ...],
 ) -> np.ndarray | None:
@@ -449,7 +450,7 @@ def build_extra_aux_batch_from_npz(
 
 
 def build_aux_batch_from_npz(
-    data: np.lib.npyio.NpzFile,
+    data: ReplayArchive,
     global_indices: np.ndarray,
     included_groups: tuple[ExtraFeatureGroup, ...],
     current_pieces: np.ndarray | None = None,
@@ -462,7 +463,7 @@ def build_aux_batch_from_npz(
 
 
 def build_torch_batch_from_npz(
-    data: np.lib.npyio.NpzFile,
+    data: ReplayArchive,
     global_indices: np.ndarray,
     device: torch.device,
     included_groups: tuple[ExtraFeatureGroup, ...],
@@ -497,7 +498,7 @@ def build_torch_batch_from_npz(
 
 
 def build_tensor_dataset(
-    data: np.lib.npyio.NpzFile,
+    data: ReplayArchive,
     selected_global_indices: np.ndarray,
     mode: str,
     train_device: torch.device,
@@ -1048,7 +1049,7 @@ def main(args: ScriptArgs) -> None:
         "comparison/curves/eval_val_value_loss/*", step_metric="offline_step"
     )
 
-    npz = np.load(args.data_path, mmap_mode="r")
+    npz = open_replay_npz(args.data_path, mmap_mode="r")
     try:
         ensure_required_keys(npz, extra_feature_groups)
         total_examples = validate_shapes(npz, extra_feature_groups)

@@ -272,7 +272,7 @@ pub(super) struct SharedBuffer {
 }
 
 pub(super) struct SharedBufferState {
-    pub(super) examples: VecDeque<TrainingExample>,
+    pub(super) examples: VecDeque<CompactExample>,
     pub(super) end_index: u64,
 }
 
@@ -339,7 +339,7 @@ fn replace_snapshot_file(
 
 struct SnapshotRequest {
     filepath: PathBuf,
-    examples: Vec<TrainingExample>,
+    examples: Vec<CompactExample>,
 }
 
 struct SnapshotPersisterState {
@@ -373,7 +373,7 @@ impl SnapshotPersister {
         persister
     }
 
-    pub(super) fn submit_snapshot(&self, filepath: PathBuf, examples: Vec<TrainingExample>) {
+    pub(super) fn submit_snapshot(&self, filepath: PathBuf, examples: Vec<CompactExample>) {
         if examples.is_empty() {
             return;
         }
@@ -471,8 +471,18 @@ impl SharedBuffer {
         }
     }
 
-    /// Add examples to the buffer, evicting oldest if over capacity.
+    /// Compact and add freshly generated examples, evicting oldest if over capacity.
     pub(super) fn add_examples(&self, new_examples: Vec<TrainingExample>) {
+        // Pack before taking the write lock so concurrent workers do not serialise on it.
+        let compact = new_examples
+            .iter()
+            .map(CompactExample::from_example)
+            .collect();
+        self.add_compact_examples(compact);
+    }
+
+    /// Add already-compact examples, evicting oldest if over capacity.
+    pub(super) fn add_compact_examples(&self, new_examples: Vec<CompactExample>) {
         if new_examples.is_empty() {
             return;
         }
@@ -496,7 +506,7 @@ impl SharedBuffer {
     }
 
     /// Snapshot the current replay FIFO window atomically.
-    pub(super) fn logical_window_snapshot(&self) -> Option<(u64, u64, Vec<TrainingExample>)> {
+    pub(super) fn logical_window_snapshot(&self) -> Option<(u64, u64, Vec<CompactExample>)> {
         let state = self.state.read().unwrap();
         let n = state.examples.len();
         if n == 0 {
@@ -513,7 +523,7 @@ impl SharedBuffer {
         &self,
         from_index: u64,
         max_examples: usize,
-    ) -> Option<(u64, u64, u64, Vec<TrainingExample>)> {
+    ) -> Option<(u64, u64, u64, Vec<CompactExample>)> {
         let state = self.state.read().unwrap();
         let n = state.examples.len();
         if n == 0 {

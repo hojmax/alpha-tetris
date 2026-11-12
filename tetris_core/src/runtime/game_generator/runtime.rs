@@ -120,44 +120,32 @@ impl GameGenerator {
 
         Some(exact_path.display().to_string())
     }
+    /// Replay examples as the compact numpy batch the trainer keeps on device:
+    /// `(board_bits (N, 25) u8, aux (N, AUX_FEATURES) f32, policy_legal (N, 64) u16,
+    /// values (N,) f32, overhang_fields (N,) f32, mask_bits (N, 84) u8)`.
+    /// See `crate::replay::compact` for the bit and policy layout.
     pub(super) fn examples_to_numpy<'py>(
         py: Python<'py>,
-        examples: &[TrainingExample],
-    ) -> PyResult<(
-        &'py PyArray2<f32>,
-        &'py PyArray2<f32>,
-        &'py PyArray2<f32>,
-        &'py PyArray1<f32>,
-        &'py PyArray1<f32>,
-        &'py PyArray2<f32>,
-    )> {
+        examples: &[CompactExample],
+    ) -> PyResult<CompactNumpyBatch<'py>> {
         let batch_size = examples.len();
 
-        let mut boards = vec![0.0f32; batch_size * BOARD_HEIGHT * BOARD_WIDTH];
+        let mut board_bits = Vec::with_capacity(batch_size * BOARD_BYTES);
         let mut aux = vec![0.0f32; batch_size * AUX_FEATURES];
-        let mut policies = vec![0.0f32; batch_size * NUM_ACTIONS];
-        let mut values = vec![0.0f32; batch_size];
-        let mut overhangs = vec![0.0f32; batch_size];
-        let mut masks = vec![0.0f32; batch_size * NUM_ACTIONS];
+        let mut policy_legal = Vec::with_capacity(batch_size * POLICY_SLOTS);
+        let mut values = Vec::with_capacity(batch_size);
+        let mut overhangs = Vec::with_capacity(batch_size);
+        let mut mask_bits = Vec::with_capacity(batch_size * MASK_BYTES);
 
         for (i, ex) in examples.iter().enumerate() {
-            for (j, &val) in ex.board.iter().enumerate() {
-                boards[i * BOARD_HEIGHT * BOARD_WIDTH + j] = val as f32;
-            }
-
-            let aux_offset = i * AUX_FEATURES;
-            let aux_slice = &mut aux[aux_offset..aux_offset + AUX_FEATURES];
-            let hold_piece = if ex.hold_piece < NUM_PIECE_TYPES {
-                Some(ex.hold_piece)
-            } else {
-                None
-            };
+            board_bits.extend_from_slice(&ex.board_bits);
+            let aux_slice = &mut aux[i * AUX_FEATURES..(i + 1) * AUX_FEATURES];
             crate::inference::encode_aux_features(
                 aux_slice,
-                ex.current_piece,
-                hold_piece,
+                usize::from(ex.current_piece),
+                ex.hold_piece_type(),
                 ex.hold_available,
-                &ex.next_queue,
+                &ex.next_queue_pieces(),
                 ex.placement_count,
                 ex.combo,
                 ex.back_to_back,
@@ -172,43 +160,31 @@ impl GameGenerator {
             )
             .map_err(|error| {
                 PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "Failed to encode aux features for sampled example {}: {}",
+                    "Failed to encode aux features for replay example {}: {}",
                     i, error
                 ))
             })?;
-
-            for (j, &val) in ex.policy.iter().enumerate() {
-                policies[i * NUM_ACTIONS + j] = val;
-            }
-            values[i] = ex.value;
-            overhangs[i] = ex.overhang_fields;
-            for (j, &val) in ex.action_mask.iter().enumerate() {
-                masks[i * NUM_ACTIONS + j] = if val { 1.0 } else { 0.0 };
-            }
+            policy_legal.extend_from_slice(&ex.policy_legal);
+            values.push(ex.value);
+            overhangs.push(ex.overhang_fields);
+            mask_bits.extend_from_slice(&ex.mask_bits);
         }
 
-        let boards_arr = PyArray1::from_vec(py, boards)
-            .reshape([batch_size, BOARD_HEIGHT * BOARD_WIDTH])
-            .unwrap();
-        let aux_arr = PyArray1::from_vec(py, aux)
-            .reshape([batch_size, AUX_FEATURES])
-            .unwrap();
-        let policies_arr = PyArray1::from_vec(py, policies)
-            .reshape([batch_size, NUM_ACTIONS])
-            .unwrap();
-        let values_arr = PyArray1::from_vec(py, values);
-        let overhangs_arr = PyArray1::from_vec(py, overhangs);
-        let masks_arr = PyArray1::from_vec(py, masks)
-            .reshape([batch_size, NUM_ACTIONS])
-            .unwrap();
-
         Ok((
-            boards_arr,
-            aux_arr,
-            policies_arr,
-            values_arr,
-            overhangs_arr,
-            masks_arr,
+            PyArray1::from_vec(py, board_bits)
+                .reshape([batch_size, BOARD_BYTES])
+                .unwrap(),
+            PyArray1::from_vec(py, aux)
+                .reshape([batch_size, AUX_FEATURES])
+                .unwrap(),
+            PyArray1::from_vec(py, policy_legal)
+                .reshape([batch_size, POLICY_SLOTS])
+                .unwrap(),
+            PyArray1::from_vec(py, values),
+            PyArray1::from_vec(py, overhangs),
+            PyArray1::from_vec(py, mask_bits)
+                .reshape([batch_size, MASK_BYTES])
+                .unwrap(),
         ))
     }
 

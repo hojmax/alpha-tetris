@@ -25,6 +25,7 @@ from tetris_bot.constants import (
 from tetris_bot.ml.network import COMBO_NORMALIZATION_MAX
 from tetris_bot.scripts.inspection.value_predictor import try_load_value_predictor
 from tetris_bot.visualization import compute_spawn_and_ghost, render_board
+from tetris_bot.ml.replay_npz import ReplayArchive, open_replay_npz
 
 SCRIPT_DIR = Path(__file__).parent
 OUTPUTS_DIR = SCRIPT_DIR / "outputs"
@@ -60,7 +61,7 @@ def find_game_boundaries(move_numbers: np.ndarray) -> list[tuple[int, int]]:
     return games
 
 
-def build_game_slices(data: np.lib.npyio.NpzFile) -> list[GameSlice]:
+def build_game_slices(data: ReplayArchive) -> list[GameSlice]:
     """Build game slices with metadata aligned to WandB game numbers when available."""
     n_examples = len(data["boards"])
     if n_examples == 0:
@@ -205,7 +206,7 @@ def format_policy_targets_preview(arr: np.ndarray, edge_items: int) -> str:
 
 
 def print_game_buffer_vectors(
-    data: np.lib.npyio.NpzFile, start: int, end: int, policy_targets_edge_items: int
+    data: ReplayArchive, start: int, end: int, policy_targets_edge_items: int
 ) -> None:
     """Print full game slice vectors and matrices from the replay buffer."""
     game_slice = slice(start, end)
@@ -281,7 +282,7 @@ def main(args: ScriptArgs) -> None:
         value_predictor = None
 
     # Load data
-    with np.load(args.data_path) as data:
+    with open_replay_npz(args.data_path) as data:
         n_examples = len(data["boards"])
         games = build_game_slices(data)
         n_games = len(games)
@@ -468,7 +469,9 @@ def main(args: ScriptArgs) -> None:
 
         post_board = np.array(env.get_board(), dtype=np.uint8)
         post_current = env.get_current_piece()
-        post_current_type = post_current.piece_type if post_current is not None else None
+        post_current_type = (
+            post_current.piece_type if post_current is not None else None
+        )
         post_hold = env.get_hold_piece()
         post_hold_type = post_hold.piece_type if post_hold is not None else None
         post_queue = list(env.get_queue(QUEUE_SIZE))

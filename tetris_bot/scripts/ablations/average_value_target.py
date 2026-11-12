@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import numpy as np
+from tetris_bot.ml.replay_npz import open_replay_npz
 from pydantic.dataclasses import dataclass
 from simple_parsing import field as sp_field
 from simple_parsing import parse
@@ -35,7 +36,7 @@ def main(args: ScriptArgs) -> None:
             f"Expected a .npz replay buffer file, got: {args.replay_buffer_path}"
         )
 
-    with np.load(args.replay_buffer_path) as data:
+    with open_replay_npz(args.replay_buffer_path) as data:
         if "value_targets" not in data:
             raise KeyError("Replay buffer is missing required key 'value_targets'")
         if "move_numbers" not in data:

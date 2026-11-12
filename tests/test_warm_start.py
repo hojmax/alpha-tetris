@@ -41,6 +41,7 @@ from tetris_bot.scripts.warm_start import (
     WarmStartDatasetSetup,
     warm_start_selection_metric,
 )
+from tetris_bot.ml.replay_npz import ReplayArchive
 
 _DEFAULT_CONFIG = load_training_config(DEFAULT_CONFIG_PATH)
 _DEFAULT_NETWORK = _DEFAULT_CONFIG.network
@@ -514,7 +515,7 @@ def test_train_warm_start_model_evaluates_and_snapshots_ema_weights(
     model = TetrisNet(**_DEFAULT_NETWORK.to_model_kwargs())
     dataset_setup = WarmStartDatasetSetup(
         source=OfflineDataSource(
-            npz=cast(np.lib.npyio.NpzFile, object()),
+            npz=cast(ReplayArchive, object()),
             selected_global_indices=np.array([0, 1], dtype=np.int64),
             tensor_data=None,
         ),

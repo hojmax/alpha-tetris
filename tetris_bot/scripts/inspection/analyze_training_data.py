@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+from tetris_bot.ml.replay_npz import ReplayArchive, open_replay_npz
 from simple_parsing import parse
 
 EXPECTED_NUM_COLUMNS = 10
@@ -75,7 +76,7 @@ def print_normalized_range_check(name: str, values: np.ndarray) -> None:
     )
 
 
-def validate_array_lengths(data: np.lib.npyio.NpzFile, n_examples: int) -> None:
+def validate_array_lengths(data: ReplayArchive, n_examples: int) -> None:
     for key in REQUIRED_KEYS:
         if key not in data:
             raise KeyError(f"missing required key: {key}")
@@ -85,7 +86,7 @@ def validate_array_lengths(data: np.lib.npyio.NpzFile, n_examples: int) -> None:
             )
 
 
-def validate_shapes(data: np.lib.npyio.NpzFile) -> None:
+def validate_shapes(data: ReplayArchive) -> None:
     if data["next_hidden_piece_probs"].shape[1] != EXPECTED_NUM_PIECES:
         raise ValueError(
             "next_hidden_piece_probs second dimension must be 7, got "
@@ -153,7 +154,7 @@ def main(args: ScriptArgs) -> None:
     if args.data_path.suffix != ".npz":
         raise ValueError(f"expected .npz file, got: {args.data_path}")
 
-    with np.load(args.data_path) as data:
+    with open_replay_npz(args.data_path) as data:
         n_examples = len(data["boards"])
         validate_array_lengths(data, n_examples)
         validate_shapes(data)

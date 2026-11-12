@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 import math
 from pathlib import Path
 import random
@@ -19,8 +19,6 @@ import torch
 import wandb
 
 from tetris_bot.constants import (
-    BOARD_HEIGHT,
-    BOARD_WIDTH,
     INCUMBENT_ONNX_FILENAME,
     LATEST_ONNX_FILENAME,
     MODEL_CANDIDATES_DIRNAME,
@@ -63,7 +61,11 @@ from tetris_bot.ml.background_process import (
     TrainerBackgroundProcess,
 )
 from tetris_bot.visualization import ReplayLike
-from tetris_bot.ml.replay_buffer import TrainingBatch, CircularReplayMirror
+from tetris_bot.ml.replay_buffer import (
+    CircularReplayMirror,
+    CompactBatch,
+    TrainingBatch,
+)
 from tetris_bot.ml.game_metrics import (
     average_completed_games,
     compute_batch_feature_metrics,
@@ -1695,134 +1697,35 @@ class Trainer:
             cumulative_games=cumulative_games,
         )
 
-    def _build_training_batch(
-        self,
-        sample: tuple,
-    ) -> TrainingBatch:
-        (
-            boards,
-            aux,
-            policy_targets,
-            value_targets,
-            overhang_fields,
-            masks,
-        ) = sample
-        return TrainingBatch(
-            boards=torch.from_numpy(boards).reshape(-1, 1, BOARD_HEIGHT, BOARD_WIDTH),
-            aux=torch.from_numpy(aux),
-            policy_targets=torch.from_numpy(policy_targets),
-            value_targets=torch.from_numpy(value_targets),
-            overhang_fields=torch.from_numpy(overhang_fields),
-            masks=torch.from_numpy(masks),
-        )
+    def _should_pin_host_batches(self) -> bool:
+        return self.device.type == "cuda" and self.config.replay.pin_memory_batches
 
-    def _pin_batch_if_needed(self, batch: TrainingBatch) -> TrainingBatch:
-        should_pin = (
-            self.device.type == "cuda"
-            and self.config.replay.pin_memory_batches
-            and batch.device.type == "cpu"
-        )
-        if not should_pin:
-            return batch
-        return TrainingBatch(
-            boards=batch.boards.pin_memory(),
-            aux=batch.aux.pin_memory(),
-            policy_targets=batch.policy_targets.pin_memory(),
-            value_targets=batch.value_targets.pin_memory(),
-            overhang_fields=batch.overhang_fields.pin_memory(),
-            masks=batch.masks.pin_memory(),
-        )
-
-    def _is_batch_on_training_device(self, batch: TrainingBatch) -> bool:
-        batch_device = batch.device
-        if batch_device.type != self.device.type:
+    def _is_on_training_device(self, device: torch.device) -> bool:
+        if device.type != self.device.type:
             return False
-        if self.device.type != "cuda":
+        if self.device.type != "cuda" or self.device.index is None:
             return True
-        if self.device.index is None:
-            return True
-        return batch_device.index == self.device.index
+        return device.index == self.device.index
+
+    def _move_to_training_device(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self._should_pin_host_batches() and tensor.device.type == "cpu":
+            tensor = tensor.pin_memory()
+        return tensor.to(self.device, non_blocking=self.device.type == "cuda")
 
     def _to_training_device(self, batch: TrainingBatch) -> TrainingBatch:
-        if self._is_batch_on_training_device(batch):
+        if self._is_on_training_device(batch.device):
             return batch
-        batch = self._pin_batch_if_needed(batch)
-        non_blocking = self.device.type == "cuda"
         return TrainingBatch(
-            boards=batch.boards.to(self.device, non_blocking=non_blocking),
-            aux=batch.aux.to(self.device, non_blocking=non_blocking),
-            policy_targets=batch.policy_targets.to(
-                self.device, non_blocking=non_blocking
-            ),
-            value_targets=batch.value_targets.to(
-                self.device, non_blocking=non_blocking
-            ),
-            overhang_fields=batch.overhang_fields.to(
-                self.device, non_blocking=non_blocking
-            ),
-            masks=batch.masks.to(self.device, non_blocking=non_blocking),
+            **{
+                f.name: self._move_to_training_device(getattr(batch, f.name))
+                for f in fields(batch)
+            }
         )
 
-    def _training_batch_bytes(self, batch: TrainingBatch) -> int:
-        tensors = (
-            batch.boards,
-            batch.aux,
-            batch.policy_targets,
-            batch.value_targets,
-            batch.overhang_fields,
-            batch.masks,
-        )
-        return sum(t.numel() * t.element_size() for t in tensors)
-
-    @staticmethod
-    def _tensor_field_pairs(
-        mirror: CircularReplayMirror,
-        batch: TrainingBatch,
-    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        return [
-            (mirror.boards, batch.boards),
-            (mirror.aux, batch.aux),
-            (mirror.policy_targets, batch.policy_targets),
-            (mirror.value_targets, batch.value_targets),
-            (mirror.overhang_fields, batch.overhang_fields),
-            (mirror.masks, batch.masks),
-        ]
-
-    def _write_to_mirror(
-        self,
-        mirror: CircularReplayMirror,
-        batch: TrainingBatch,
-    ) -> None:
-        n = batch.size
-        if n == 0:
-            return
-        if n > mirror.capacity:
-            offset = n - mirror.capacity
-            batch = TrainingBatch(
-                boards=batch.boards[offset:],
-                aux=batch.aux[offset:],
-                policy_targets=batch.policy_targets[offset:],
-                value_targets=batch.value_targets[offset:],
-                overhang_fields=batch.overhang_fields[offset:],
-                masks=batch.masks[offset:],
-            )
-            n = mirror.capacity
-
-        end_pos = mirror.write_pos + n
-        pairs = self._tensor_field_pairs(mirror, batch)
-        if end_pos <= mirror.capacity:
-            s = slice(mirror.write_pos, end_pos)
-            for dst, src in pairs:
-                dst[s].copy_(src)
-        else:
-            tail = mirror.capacity - mirror.write_pos
-            head = n - tail
-            for dst, src in pairs:
-                dst[mirror.write_pos :].copy_(src[:tail])
-                dst[:head].copy_(src[tail:])
-
-        mirror.write_pos = (mirror.write_pos + n) % mirror.capacity
-        mirror.count = min(mirror.count + n, mirror.capacity)
+    def _compact_to_training_device(self, batch: CompactBatch) -> CompactBatch:
+        if self._is_on_training_device(batch.device):
+            return batch
+        return batch.map(self._move_to_training_device)
 
     def _sample_prefetched_batches(
         self,
@@ -1832,8 +1735,8 @@ class Trainer:
         result = generator.sample_batch(staged_batch_size)
         if result is None:
             return None
-        staged_batch = self._to_training_device(self._build_training_batch(result))
-        return staged_batch.split(self.config.optimizer.batch_size)
+        compact = self._compact_to_training_device(CompactBatch.from_numpy(result))
+        return compact.decode().split(self.config.optimizer.batch_size)
 
     def _use_device_replay_mirror(self) -> bool:
         return (
@@ -1848,9 +1751,7 @@ class Trainer:
     ) -> CircularReplayMirror | None:
         if mirror is None:
             mirror = CircularReplayMirror(self.config.replay.buffer_size, self.device)
-        mirror.count = 0
-        mirror.write_pos = 0
-        mirror.logical_end = 0
+        mirror.reset()
         # Bootstrap from bounded replay deltas so a resumed full buffer does not
         # stage the entire replay window on the training device at once.
         return self._refresh_replay_mirror(generator, mirror)
@@ -1872,17 +1773,7 @@ class Trainer:
             )
             if result is None:
                 return None
-            (
-                window_start,
-                window_end,
-                slice_start,
-                boards,
-                aux,
-                policy_targets,
-                value_targets,
-                overhang_fields,
-                masks,
-            ) = result
+            window_start, window_end, slice_start, arrays = result
             window_start = int(window_start)
             window_end = int(window_end)
             slice_start = int(slice_start)
@@ -1903,19 +1794,15 @@ class Trainer:
                         window_start_index=window_start,
                         window_end_index=window_end,
                     )
-                mirror.count = 0
-                mirror.write_pos = 0
-                mirror.logical_end = window_start
+                mirror.reset(logical_end=window_start)
 
-            delta_batch = self._to_training_device(
-                self._build_training_batch(
-                    (boards, aux, policy_targets, value_targets, overhang_fields, masks)
-                )
+            delta_batch = self._compact_to_training_device(
+                CompactBatch.from_numpy(arrays)
             )
             if delta_batch.size > 0:
                 delta_examples_total += delta_batch.size
-                delta_bytes_total += self._training_batch_bytes(delta_batch)
-                self._write_to_mirror(mirror, delta_batch)
+                delta_bytes_total += delta_batch.nbytes()
+                mirror.write(delta_batch)
                 mirror.logical_end += delta_batch.size
 
             if mirror.logical_end >= window_end:
@@ -1932,22 +1819,7 @@ class Trainer:
                 return mirror
 
     def _sample_from_replay_mirror(self, mirror: CircularReplayMirror) -> TrainingBatch:
-        if mirror.count <= 0:
-            raise ValueError("Replay mirror is empty")
-        sample_indices = torch.randint(
-            low=0,
-            high=mirror.count,
-            size=(self.config.optimizer.batch_size,),
-            device=mirror.boards.device,
-        )
-        return TrainingBatch(
-            boards=mirror.boards.index_select(0, sample_indices),
-            aux=mirror.aux.index_select(0, sample_indices),
-            policy_targets=mirror.policy_targets.index_select(0, sample_indices),
-            value_targets=mirror.value_targets.index_select(0, sample_indices),
-            overhang_fields=mirror.overhang_fields.index_select(0, sample_indices),
-            masks=mirror.masks.index_select(0, sample_indices),
-        )
+        return mirror.sample(self.config.optimizer.batch_size)
 
     def train_step(
         self, batch: TrainingBatch, collect_metrics: bool

@@ -1,13 +1,22 @@
 //! NPZ File I/O
 //!
-//! Read and write training examples in NPZ format (compatible with Python numpy).
+//! Read and write replay examples in NPZ format (compatible with Python numpy).
+//!
+//! The policy and legal-action mask are stored in the compact form the replay buffer
+//! keeps in memory (see [`crate::replay::compact`]): `action_mask_bits` (N, 84) uint8 and
+//! `policy_legal` (N, 64) uint16. Snapshots written before that change carry dense
+//! `policy_targets` / `action_masks` (672 wide, or the legacy 734 wide); the reader converts
+//! those on the fly so existing runs can still be resumed and warm-started from.
+//!
+//! Reading streams every column straight into [`CompactExample`]s, so peak memory is the
+//! compact buffer itself rather than the decoded dense arrays.
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 
 use npyz::{NpyFile, WriterBuilder};
-use zip::read::ZipArchive;
+use zip::read::{ZipArchive, ZipFile};
 use zip::write::{FileOptions, ZipWriter};
 use zip::CompressionMethod;
 
@@ -18,31 +27,34 @@ use crate::game::action_space::{
 use crate::game::constants::{
     BOARD_HEIGHT, BOARD_WIDTH, NUM_PIECE_TYPES, QUEUE_SIZE, ROW_FILL_FEATURE_ROWS,
 };
-use crate::search::{TrainingExample, NUM_ACTIONS};
+use crate::replay::compact::{
+    get_bit, pack_board, pack_policy, CompactExample, BOARD_BYTES, BOARD_CELLS, EMPTY_QUEUE_SLOT,
+    MASK_BYTES, POLICY_SLOTS,
+};
+use crate::search::NUM_ACTIONS;
 
-/// Write training examples to NPZ format (compatible with Python numpy).
-///
-/// Convenience wrapper over [`write_examples_slices_to_npz`] for a single contiguous slice.
-pub fn write_examples_to_npz(filepath: &Path, examples: &[TrainingExample]) -> Result<(), String> {
+type Archive = ZipArchive<BufReader<File>>;
+
+/// Write replay examples to NPZ format (compatible with Python numpy).
+pub fn write_examples_to_npz(filepath: &Path, examples: &[CompactExample]) -> Result<(), String> {
     write_examples_slices_to_npz(filepath, examples, &[])
 }
 
 /// Streaming NPZ writer that accepts two contiguous slices (to support VecDeque::as_slices()).
 ///
 /// Each array is streamed directly from the examples to the zip file — no intermediate
-/// column vectors or in-memory buffers are allocated. Peak memory overhead is negligible
-/// beyond the examples themselves.
+/// column vectors are allocated.
 ///
-/// Format matches the Python training dataset layout expected by scripts:
-/// - boards: (N, 20, 10) bool
+/// Layout:
+/// - boards: (N, 20, 10) uint8
 /// - current_pieces: (N, 7) float32 one-hot
 /// - hold_pieces: (N, 8) float32 one-hot
-/// - hold_available: (N,) bool
-/// - next_queue: (N, 5, 7) float32 one-hot
+/// - hold_available: (N,) uint8
+/// - next_queue: (N, 5, 7) float32 one-hot (all-zero rows for missing slots)
 /// - move_numbers: (N,) uint32 raw frame indices (includes holds)
 /// - placement_counts: (N,) float32 normalized (placement_idx / max_placements, [0,1])
 /// - combos: (N,) float32 normalized (combo / COMBO_NORMALIZATION_MAX, uncapped)
-/// - back_to_back: (N,) bool
+/// - back_to_back: (N,) uint8
 /// - next_hidden_piece_probs: (N, 7) float32
 /// - column_heights: (N, 10) float32 normalized by COLUMN_HEIGHT_NORMALIZATION_DIVISOR (uncapped)
 /// - max_column_heights: (N,) float32
@@ -50,16 +62,17 @@ pub fn write_examples_to_npz(filepath: &Path, examples: &[TrainingExample]) -> R
 /// - total_blocks: (N,) float32 normalized by TOTAL_BLOCKS_NORMALIZATION_DIVISOR (uncapped)
 /// - bumpiness: (N,) float32 normalized by BUMPINESS_NORMALIZATION_DIVISOR (uncapped)
 /// - holes: (N,) float32 normalized by HOLES_NORMALIZATION_DIVISOR (uncapped)
-/// - policy_targets: (N, 672) float32
+/// - action_mask_bits: (N, 84) uint8, legal actions bit-packed with little bit order
+/// - policy_legal: (N, 64) uint16, policy of the i-th legal action (ascending action
+///   index) as `round(p * 65535)`; unused slots are 0
 /// - value_targets: (N,) float32
-/// - action_masks: (N, 672) bool
 /// - overhang_fields: (N,) float32 normalized by OVERHANG_NORMALIZATION_DIVISOR (uncapped)
 /// - game_numbers: (N,) uint64 (1-indexed game IDs aligned with WandB game_number)
 /// - game_total_attacks: (N,) uint32 (raw total attack for each example's source game)
 pub(crate) fn write_examples_slices_to_npz(
     filepath: &Path,
-    examples_a: &[TrainingExample],
-    examples_b: &[TrainingExample],
+    examples_a: &[CompactExample],
+    examples_b: &[CompactExample],
 ) -> Result<(), String> {
     let n = examples_a.len() + examples_b.len();
     if n == 0 {
@@ -71,195 +84,165 @@ pub(crate) fn write_examples_slices_to_npz(
 
     let file = File::create(filepath).map_err(|e| e.to_string())?;
     let mut zip = ZipWriter::new(BufWriter::new(file));
-    // Replay snapshots can exceed 4 GiB for large buffers (notably policy_targets),
-    // so ZIP64 must be enabled to emit valid archives.
-    // Deflate level 1 (fastest) instead of default level 6: policy_targets (N×NUM_ACTIONS f32)
-    // dominates the file and compresses poorly (high-entropy floats), so higher
-    // levels burn hours of CPU for negligible extra compression.
+    // Snapshots of large buffers can exceed 4 GiB, so ZIP64 must be enabled.
+    // Deflate level 1: higher levels burn far more CPU for little extra compression.
     let options = FileOptions::default()
         .compression_method(CompressionMethod::Deflated)
         .compression_level(Some(1))
         .large_file(true);
+    let z = &mut zip;
 
-    write_example_flat_field(
-        &mut zip,
+    write_flat_field(
+        z,
         options,
         "boards.npy",
         n64,
         &[BOARD_HEIGHT as u64, BOARD_WIDTH as u64],
-        examples().flat_map(|ex| ex.board.iter().copied()),
+        examples()
+            .flat_map(|ex| (0..BOARD_CELLS).map(|cell| u8::from(get_bit(&ex.board_bits, cell)))),
     )?;
-
-    write_example_flat_field(
-        &mut zip,
+    write_flat_field(
+        z,
         options,
         "current_pieces.npy",
         n64,
         &[NUM_PIECE_TYPES as u64],
-        examples().flat_map(|ex| encode_piece_one_hot(ex.current_piece).into_iter()),
+        examples().flat_map(|ex| one_hot::<NUM_PIECE_TYPES>(Some(ex.current_piece.into()))),
     )?;
-
-    write_example_flat_field(
-        &mut zip,
+    write_flat_field(
+        z,
         options,
         "hold_pieces.npy",
         n64,
         &[(NUM_PIECE_TYPES + 1) as u64],
-        examples().flat_map(|ex| encode_hold_piece_one_hot(ex.hold_piece).into_iter()),
+        examples().flat_map(|ex| one_hot::<{ NUM_PIECE_TYPES + 1 }>(Some(ex.hold_piece.into()))),
     )?;
-
-    write_example_scalar_field(
-        &mut zip,
+    write_scalar_field(
+        z,
         options,
         "hold_available.npy",
         n64,
         examples().map(|ex| ex.hold_available as u8),
     )?;
-
-    write_example_flat_field(
-        &mut zip,
+    write_flat_field(
+        z,
         options,
         "next_queue.npy",
         n64,
         &[QUEUE_SIZE as u64, NUM_PIECE_TYPES as u64],
-        examples().flat_map(|ex| encode_next_queue(ex).into_iter()),
+        examples().flat_map(|ex| {
+            ex.next_queue.into_iter().flat_map(|piece| {
+                one_hot::<NUM_PIECE_TYPES>((piece != EMPTY_QUEUE_SLOT).then_some(piece.into()))
+            })
+        }),
     )?;
-
-    write_example_scalar_field(
-        &mut zip,
+    write_scalar_field(
+        z,
         options,
         "move_numbers.npy",
         n64,
         examples().map(|ex| ex.move_number),
     )?;
-
-    write_example_scalar_field(
-        &mut zip,
+    write_scalar_field(
+        z,
         options,
         "placement_counts.npy",
         n64,
         examples().map(|ex| ex.placement_count),
     )?;
-
-    write_example_scalar_field(
-        &mut zip,
-        options,
-        "combos.npy",
-        n64,
-        examples().map(|ex| ex.combo),
-    )?;
-
-    write_example_scalar_field(
-        &mut zip,
+    write_scalar_field(z, options, "combos.npy", n64, examples().map(|ex| ex.combo))?;
+    write_scalar_field(
+        z,
         options,
         "back_to_back.npy",
         n64,
         examples().map(|ex| ex.back_to_back as u8),
     )?;
-
-    write_example_flat_field(
-        &mut zip,
+    write_flat_field(
+        z,
         options,
         "next_hidden_piece_probs.npy",
         n64,
         &[NUM_PIECE_TYPES as u64],
-        examples().flat_map(|ex| ex.next_hidden_piece_probs.iter().copied()),
+        examples().flat_map(|ex| ex.next_hidden_piece_probs),
     )?;
-
-    write_example_flat_field(
-        &mut zip,
+    write_flat_field(
+        z,
         options,
         "column_heights.npy",
         n64,
         &[BOARD_WIDTH as u64],
-        examples().flat_map(|ex| ex.column_heights.iter().copied()),
+        examples().flat_map(|ex| ex.column_heights),
     )?;
-
-    write_example_scalar_field(
-        &mut zip,
+    write_scalar_field(
+        z,
         options,
         "max_column_heights.npy",
         n64,
         examples().map(|ex| ex.max_column_height),
     )?;
-
-    write_example_flat_field(
-        &mut zip,
+    write_flat_field(
+        z,
         options,
         "row_fill_counts.npy",
         n64,
         &[ROW_FILL_FEATURE_ROWS as u64],
-        examples().flat_map(|ex| ex.row_fill_counts.iter().copied()),
+        examples().flat_map(|ex| ex.row_fill_counts),
     )?;
-
-    write_example_scalar_field(
-        &mut zip,
+    write_scalar_field(
+        z,
         options,
         "total_blocks.npy",
         n64,
         examples().map(|ex| ex.total_blocks),
     )?;
-
-    write_example_scalar_field(
-        &mut zip,
+    write_scalar_field(
+        z,
         options,
         "bumpiness.npy",
         n64,
         examples().map(|ex| ex.bumpiness),
     )?;
-
-    write_example_scalar_field(
-        &mut zip,
+    write_scalar_field(z, options, "holes.npy", n64, examples().map(|ex| ex.holes))?;
+    write_flat_field(
+        z,
         options,
-        "holes.npy",
+        "action_mask_bits.npy",
         n64,
-        examples().map(|ex| ex.holes),
+        &[MASK_BYTES as u64],
+        examples().flat_map(|ex| ex.mask_bits),
     )?;
-
-    write_example_flat_field(
-        &mut zip,
+    write_flat_field(
+        z,
         options,
-        "policy_targets.npy",
+        "policy_legal.npy",
         n64,
-        &[NUM_ACTIONS as u64],
-        examples().flat_map(|ex| ex.policy.iter().copied()),
+        &[POLICY_SLOTS as u64],
+        examples().flat_map(|ex| ex.policy_legal),
     )?;
-
-    write_example_scalar_field(
-        &mut zip,
+    write_scalar_field(
+        z,
         options,
         "value_targets.npy",
         n64,
         examples().map(|ex| ex.value),
     )?;
-
-    write_example_flat_field(
-        &mut zip,
-        options,
-        "action_masks.npy",
-        n64,
-        &[NUM_ACTIONS as u64],
-        examples().flat_map(|ex| ex.action_mask.iter().map(|&b| b as u8)),
-    )?;
-
-    write_example_scalar_field(
-        &mut zip,
+    write_scalar_field(
+        z,
         options,
         "overhang_fields.npy",
         n64,
         examples().map(|ex| ex.overhang_fields),
     )?;
-
-    write_example_scalar_field(
-        &mut zip,
+    write_scalar_field(
+        z,
         options,
         "game_numbers.npy",
         n64,
         examples().map(|ex| ex.game_number),
     )?;
-
-    write_example_scalar_field(
-        &mut zip,
+    write_scalar_field(
+        z,
         options,
         "game_total_attacks.npy",
         n64,
@@ -270,173 +253,191 @@ pub(crate) fn write_examples_slices_to_npz(
     Ok(())
 }
 
-/// Read training examples from NPZ format.
-pub fn read_examples_from_npz(filepath: &Path) -> Result<Vec<TrainingExample>, String> {
+fn blank_example() -> CompactExample {
+    CompactExample {
+        board_bits: [0; BOARD_BYTES],
+        current_piece: 0,
+        hold_piece: NUM_PIECE_TYPES as u8,
+        hold_available: false,
+        back_to_back: false,
+        next_queue: [EMPTY_QUEUE_SLOT; QUEUE_SIZE],
+        move_number: 0,
+        placement_count: 0.0,
+        combo: 0.0,
+        next_hidden_piece_probs: [0.0; NUM_PIECE_TYPES],
+        column_heights: [0.0; BOARD_WIDTH],
+        max_column_height: 0.0,
+        row_fill_counts: [0.0; ROW_FILL_FEATURE_ROWS],
+        total_blocks: 0.0,
+        bumpiness: 0.0,
+        holes: 0.0,
+        overhang_fields: 0.0,
+        value: 0.0,
+        game_number: 0,
+        game_total_attack: 0,
+        mask_bits: [0; MASK_BYTES],
+        policy_legal: [0; POLICY_SLOTS],
+    }
+}
+
+/// Read replay examples from NPZ format (compact, dense, or legacy-width dense policy).
+pub fn read_examples_from_npz(filepath: &Path) -> Result<Vec<CompactExample>, String> {
     let file = File::open(filepath).map_err(|e| e.to_string())?;
     let mut archive = ZipArchive::new(BufReader::new(file)).map_err(|e| e.to_string())?;
+    let is_compact = archive.file_names().any(|name| name == "policy_legal.npy");
 
-    let (boards, n) = read_dynamic_batch_field::<u8>(
-        &mut archive,
+    let shape = npy_shape(&mut archive, "boards")?;
+    let n = validate_shape_with_dynamic_batch(
         "boards",
-        &[BOARD_HEIGHT as u64, BOARD_WIDTH as u64],
+        &shape,
+        &[0, BOARD_HEIGHT as u64, BOARD_WIDTH as u64],
     )?;
-    let current_pieces =
-        read_batch_field::<f32>(&mut archive, "current_pieces", n, &[NUM_PIECE_TYPES as u64])?;
-    let hold_pieces = read_batch_field::<f32>(
-        &mut archive,
-        "hold_pieces",
-        n,
-        &[(NUM_PIECE_TYPES + 1) as u64],
-    )?;
-    let hold_available = read_bool_like_batch_field(&mut archive, "hold_available", n, &[])?;
-    let next_queue = read_batch_field::<f32>(
-        &mut archive,
-        "next_queue",
-        n,
-        &[QUEUE_SIZE as u64, NUM_PIECE_TYPES as u64],
-    )?;
-    let move_numbers = read_batch_field::<u32>(&mut archive, "move_numbers", n, &[])?;
-    let placement_counts = read_batch_field::<f32>(&mut archive, "placement_counts", n, &[])?;
-    let combos = read_batch_field::<f32>(&mut archive, "combos", n, &[])?;
-    let back_to_back = read_bool_like_batch_field(&mut archive, "back_to_back", n, &[])?;
-    let next_hidden_piece_probs = read_batch_field::<f32>(
-        &mut archive,
-        "next_hidden_piece_probs",
+    let mut ex = vec![blank_example(); n];
+    let a = &mut archive;
+
+    let board_dims = [BOARD_HEIGHT as u64, BOARD_WIDTH as u64];
+    for_each_row::<u8>(a, "boards", n, &board_dims, |i, row| {
+        ex[i].board_bits = pack_board(row);
+    })?;
+    for_each_row::<f32>(
+        a,
+        "current_pieces",
         n,
         &[NUM_PIECE_TYPES as u64],
+        |i, row| {
+            ex[i].current_piece = argmax_index(row) as u8;
+        },
     )?;
-    let column_heights =
-        read_batch_field::<f32>(&mut archive, "column_heights", n, &[BOARD_WIDTH as u64])?;
-    let max_column_heights = read_batch_field::<f32>(&mut archive, "max_column_heights", n, &[])?;
-    let row_fill_counts = read_batch_field::<f32>(
-        &mut archive,
-        "row_fill_counts",
-        n,
-        &[ROW_FILL_FEATURE_ROWS as u64],
-    )?;
-    let total_blocks = read_batch_field::<f32>(&mut archive, "total_blocks", n, &[])?;
-    let bumpiness = read_batch_field::<f32>(&mut archive, "bumpiness", n, &[])?;
-    let holes = read_batch_field::<f32>(&mut archive, "holes", n, &[])?;
-    let (policy_targets, policy_width) =
-        read_dynamic_action_field::<f32>(&mut archive, "policy_targets", n)?;
-    let value_targets = read_batch_field::<f32>(&mut archive, "value_targets", n, &[])?;
-    let (action_masks, action_mask_width) =
-        read_dynamic_bool_action_field(&mut archive, "action_masks", n)?;
-    let overhang_fields = read_batch_field::<f32>(&mut archive, "overhang_fields", n, &[])?;
-    let game_numbers = read_batch_field::<u64>(&mut archive, "game_numbers", n, &[])?;
-    let game_total_attacks = read_batch_field::<u32>(&mut archive, "game_total_attacks", n, &[])?;
+    let hold_dims = [(NUM_PIECE_TYPES + 1) as u64];
+    for_each_row::<f32>(a, "hold_pieces", n, &hold_dims, |i, row| {
+        ex[i].hold_piece = argmax_index(row).min(NUM_PIECE_TYPES) as u8;
+    })?;
+    for_each_bool_like(a, "hold_available", n, |i, value| {
+        ex[i].hold_available = value;
+    })?;
+    let queue_dims = [QUEUE_SIZE as u64, NUM_PIECE_TYPES as u64];
+    for_each_row::<f32>(a, "next_queue", n, &queue_dims, |i, row| {
+        for (slot, piece) in row.chunks_exact(NUM_PIECE_TYPES).enumerate() {
+            ex[i].next_queue[slot] = if piece.iter().any(|&v| v > 0.0) {
+                argmax_index(piece) as u8
+            } else {
+                EMPTY_QUEUE_SLOT
+            };
+        }
+    })?;
+    for_each_row::<u32>(a, "move_numbers", n, &[], |i, row| {
+        ex[i].move_number = row[0];
+    })?;
+    for_each_row::<f32>(a, "placement_counts", n, &[], |i, row| {
+        ex[i].placement_count = row[0];
+    })?;
+    for_each_row::<f32>(a, "combos", n, &[], |i, row| ex[i].combo = row[0])?;
+    for_each_bool_like(a, "back_to_back", n, |i, value| ex[i].back_to_back = value)?;
+    let piece_dims = [NUM_PIECE_TYPES as u64];
+    for_each_row::<f32>(a, "next_hidden_piece_probs", n, &piece_dims, |i, row| {
+        ex[i].next_hidden_piece_probs.copy_from_slice(row);
+    })?;
+    for_each_row::<f32>(a, "column_heights", n, &[BOARD_WIDTH as u64], |i, row| {
+        ex[i].column_heights.copy_from_slice(row);
+    })?;
+    for_each_row::<f32>(a, "max_column_heights", n, &[], |i, row| {
+        ex[i].max_column_height = row[0];
+    })?;
+    let fill_dims = [ROW_FILL_FEATURE_ROWS as u64];
+    for_each_row::<f32>(a, "row_fill_counts", n, &fill_dims, |i, row| {
+        ex[i].row_fill_counts.copy_from_slice(row);
+    })?;
+    for_each_row::<f32>(a, "total_blocks", n, &[], |i, row| {
+        ex[i].total_blocks = row[0];
+    })?;
+    for_each_row::<f32>(a, "bumpiness", n, &[], |i, row| ex[i].bumpiness = row[0])?;
+    for_each_row::<f32>(a, "holes", n, &[], |i, row| ex[i].holes = row[0])?;
+    for_each_row::<f32>(a, "value_targets", n, &[], |i, row| ex[i].value = row[0])?;
+    for_each_row::<f32>(a, "overhang_fields", n, &[], |i, row| {
+        ex[i].overhang_fields = row[0];
+    })?;
+    for_each_row::<u64>(a, "game_numbers", n, &[], |i, row| {
+        ex[i].game_number = row[0];
+    })?;
+    for_each_row::<u32>(a, "game_total_attacks", n, &[], |i, row| {
+        ex[i].game_total_attack = row[0];
+    })?;
 
-    if policy_width != action_mask_width {
-        return Err(format!(
-            "policy_targets/action_masks width mismatch: {} vs {}",
-            policy_width, action_mask_width
-        ));
+    if is_compact {
+        for_each_row::<u8>(a, "action_mask_bits", n, &[MASK_BYTES as u64], |i, row| {
+            ex[i].mask_bits.copy_from_slice(row);
+        })?;
+        for_each_row::<u16>(a, "policy_legal", n, &[POLICY_SLOTS as u64], |i, row| {
+            ex[i].policy_legal.copy_from_slice(row);
+        })?;
+    } else {
+        read_dense_policy_into(a, &mut ex)?;
     }
-    if policy_width != NUM_ACTIONS && policy_width != LEGACY_NUM_ACTIONS {
-        return Err(format!(
-            "policy_targets/action_masks width must be {} (current) or {} (legacy), got {}",
-            NUM_ACTIONS, LEGACY_NUM_ACTIONS, policy_width
-        ));
-    }
-    let action_space = get_action_space();
 
-    let mut examples = Vec::with_capacity(n);
-    let board_size = BOARD_HEIGHT * BOARD_WIDTH;
-    let hold_size = NUM_PIECE_TYPES + 1;
-    let next_queue_size = QUEUE_SIZE * NUM_PIECE_TYPES;
-    let next_hidden_piece_probs_size = NUM_PIECE_TYPES;
-    let column_heights_size = BOARD_WIDTH;
-    let row_fill_counts_size = ROW_FILL_FEATURE_ROWS;
-
-    for i in 0..n {
-        let overhang_feature = overhang_fields[i];
-        if !overhang_feature.is_finite() || overhang_feature < 0.0 {
+    for (i, example) in ex.iter().enumerate() {
+        if !example.overhang_fields.is_finite() || example.overhang_fields < 0.0 {
             return Err(format!(
                 "overhang_fields[{}] must be finite and >= 0, got {}",
-                i, overhang_feature
+                i, example.overhang_fields
             ));
         }
-
-        let board_start = i * board_size;
-        let board_end = board_start + board_size;
-
-        let current_piece_start = i * NUM_PIECE_TYPES;
-        let current_piece_end = current_piece_start + NUM_PIECE_TYPES;
-        let current_piece = argmax_index(&current_pieces[current_piece_start..current_piece_end]);
-
-        let hold_piece_start = i * hold_size;
-        let hold_piece_end = hold_piece_start + hold_size;
-        let hold_piece_index = argmax_index(&hold_pieces[hold_piece_start..hold_piece_end]);
-        let hold_piece = if hold_piece_index < NUM_PIECE_TYPES {
-            hold_piece_index
-        } else {
-            NUM_PIECE_TYPES
-        };
-
-        let next_queue_start = i * next_queue_size;
-        let mut next_queue_pieces = Vec::with_capacity(QUEUE_SIZE);
-        for slot in 0..QUEUE_SIZE {
-            let slot_start = next_queue_start + slot * NUM_PIECE_TYPES;
-            let slot_end = slot_start + NUM_PIECE_TYPES;
-            next_queue_pieces.push(argmax_index(&next_queue[slot_start..slot_end]));
-        }
-
-        let policy_start = i * policy_width;
-        let policy_end = policy_start + policy_width;
-        let mask_start = i * action_mask_width;
-        let mask_end = mask_start + action_mask_width;
-        let hidden_probs_start = i * next_hidden_piece_probs_size;
-        let hidden_probs_end = hidden_probs_start + next_hidden_piece_probs_size;
-        let column_heights_start = i * column_heights_size;
-        let column_heights_end = column_heights_start + column_heights_size;
-        let row_fill_counts_start = i * row_fill_counts_size;
-        let row_fill_counts_end = row_fill_counts_start + row_fill_counts_size;
-
-        let (policy, action_mask) = if policy_width == NUM_ACTIONS {
-            (
-                policy_targets[policy_start..policy_end].to_vec(),
-                action_masks[mask_start..mask_end]
-                    .iter()
-                    .map(|value| *value != 0)
-                    .collect(),
-            )
-        } else {
-            adapt_legacy_policy_and_mask(
-                action_space,
-                current_piece,
-                &policy_targets[policy_start..policy_end],
-                &action_masks[mask_start..mask_end],
-            )?
-        };
-
-        examples.push(TrainingExample {
-            board: boards[board_start..board_end].to_vec(),
-            current_piece,
-            hold_piece,
-            hold_available: hold_available[i] != 0,
-            next_queue: next_queue_pieces,
-            move_number: move_numbers[i],
-            placement_count: placement_counts[i],
-            combo: combos[i],
-            back_to_back: back_to_back[i] != 0,
-            next_hidden_piece_probs: next_hidden_piece_probs[hidden_probs_start..hidden_probs_end]
-                .to_vec(),
-            column_heights: column_heights[column_heights_start..column_heights_end].to_vec(),
-            max_column_height: max_column_heights[i],
-            row_fill_counts: row_fill_counts[row_fill_counts_start..row_fill_counts_end].to_vec(),
-            total_blocks: total_blocks[i],
-            bumpiness: bumpiness[i],
-            holes: holes[i],
-            policy,
-            value: value_targets[i],
-            action_mask,
-            overhang_fields: overhang_feature,
-            game_number: game_numbers[i],
-            game_total_attack: game_total_attacks[i],
-        });
     }
+    Ok(ex)
+}
 
-    Ok(examples)
+/// Convert dense `policy_targets` / `action_masks` (current or legacy width) row by row.
+fn read_dense_policy_into(archive: &mut Archive, ex: &mut [CompactExample]) -> Result<(), String> {
+    let n = ex.len();
+    let shape = npy_shape(archive, "action_masks")?;
+    if shape.len() != 2 {
+        return Err(format!("action_masks has rank {}, expected 2", shape.len()));
+    }
+    let width = shape[1] as usize;
+    if width != NUM_ACTIONS && width != LEGACY_NUM_ACTIONS {
+        return Err(format!(
+            "policy_targets/action_masks width must be {} (current) or {} (legacy), got {}",
+            NUM_ACTIONS, LEGACY_NUM_ACTIONS, width
+        ));
+    }
+    // Masks are buffered bit-packed so the policy pass can pair each row with its mask.
+    let row_bytes = width.div_ceil(8);
+    let mut mask_rows = vec![0u8; n * row_bytes];
+    for_each_bool_like_row(archive, "action_masks", n, width, |i, row| {
+        for (action, &value) in row.iter().enumerate() {
+            if value != 0 {
+                mask_rows[i * row_bytes + action / 8] |= 1 << (action % 8);
+            }
+        }
+    })?;
+
+    let action_space = get_action_space();
+    let mut mask_row = vec![0u8; width];
+    let mut failure: Option<String> = None;
+    for_each_row::<f32>(archive, "policy_targets", n, &[width as u64], |i, row| {
+        if failure.is_some() {
+            return;
+        }
+        let bits = &mask_rows[i * row_bytes..(i + 1) * row_bytes];
+        for (action, slot) in mask_row.iter_mut().enumerate() {
+            *slot = u8::from(get_bit(bits, action));
+        }
+        let (policy, mask) = if width == NUM_ACTIONS {
+            (row.to_vec(), mask_row.iter().map(|&m| m != 0).collect())
+        } else {
+            let current_piece = usize::from(ex[i].current_piece);
+            match adapt_legacy_policy_and_mask(action_space, current_piece, row, &mask_row) {
+                Ok(adapted) => adapted,
+                Err(error) => {
+                    failure = Some(error);
+                    return;
+                }
+            }
+        };
+        let (mask_bits, policy_legal) = pack_policy(&policy, &mask);
+        ex[i].mask_bits = mask_bits;
+        ex[i].policy_legal = policy_legal;
+    })?;
+    failure.map_or(Ok(()), Err)
 }
 
 fn adapt_legacy_policy_and_mask(
@@ -490,38 +491,12 @@ fn argmax_index(values: &[f32]) -> usize {
     max_index
 }
 
-fn encode_piece_one_hot(piece: usize) -> [f32; NUM_PIECE_TYPES] {
-    let mut one_hot = [0.0f32; NUM_PIECE_TYPES];
-    one_hot[piece] = 1.0;
-    one_hot
-}
-
-fn encode_hold_piece_one_hot(hold_piece: usize) -> [f32; NUM_PIECE_TYPES + 1] {
-    let mut one_hot = [0.0f32; NUM_PIECE_TYPES + 1];
-    if hold_piece < NUM_PIECE_TYPES {
-        one_hot[hold_piece] = 1.0;
-    } else {
-        one_hot[NUM_PIECE_TYPES] = 1.0;
+fn one_hot<const N: usize>(index: Option<usize>) -> [f32; N] {
+    let mut values = [0.0f32; N];
+    if let Some(index) = index {
+        values[index] = 1.0;
     }
-    one_hot
-}
-
-fn encode_next_queue(example: &TrainingExample) -> [f32; QUEUE_SIZE * NUM_PIECE_TYPES] {
-    let mut queue_data = [0.0f32; QUEUE_SIZE * NUM_PIECE_TYPES];
-    for (index, &piece) in example.next_queue.iter().take(QUEUE_SIZE).enumerate() {
-        queue_data[index * NUM_PIECE_TYPES + piece] = 1.0;
-    }
-    queue_data
-}
-
-fn validate_shape(name: &str, actual: &[u64], expected: &[u64]) -> Result<(), String> {
-    if actual != expected {
-        return Err(format!(
-            "{} has shape {:?}, expected {:?}",
-            name, actual, expected
-        ));
-    }
-    Ok(())
+    values
 }
 
 fn validate_shape_with_dynamic_batch(
@@ -566,136 +541,116 @@ fn format_expected_shape(expected_with_batch_placeholder: &[u64]) -> String {
     format!("[{}]", dims)
 }
 
-fn validate_batch_shape(
-    name: &str,
-    actual: &[u64],
+fn open_npy<'a>(
+    archive: &'a mut Archive,
+    field_name: &str,
+) -> Result<NpyFile<BufReader<ZipFile<'a>>>, String> {
+    let entry = archive
+        .by_name(&format!("{field_name}.npy"))
+        .map_err(|e| format!("{field_name}: {e}"))?;
+    NpyFile::new(BufReader::new(entry)).map_err(|e| format!("{field_name}: {e}"))
+}
+
+fn npy_shape(archive: &mut Archive, field_name: &str) -> Result<Vec<u64>, String> {
+    Ok(open_npy(archive, field_name)?.shape().to_vec())
+}
+
+fn check_batch_shape(
+    field_name: &str,
+    shape: &[u64],
     n: usize,
     trailing_dims: &[u64],
 ) -> Result<(), String> {
-    let mut expected = Vec::with_capacity(trailing_dims.len() + 1);
-    expected.push(n as u64);
+    let mut expected = vec![n as u64];
     expected.extend_from_slice(trailing_dims);
-    validate_shape(name, actual, &expected)
-}
-
-fn read_dynamic_batch_field<T: npyz::Deserialize>(
-    archive: &mut ZipArchive<BufReader<File>>,
-    field_name: &str,
-    trailing_dims: &[u64],
-) -> Result<(Vec<T>, usize), String> {
-    let entry_name = format!("{field_name}.npy");
-    let (values, shape) = read_npy_array::<T>(archive, &entry_name)?;
-    let mut expected = Vec::with_capacity(trailing_dims.len() + 1);
-    expected.push(0);
-    expected.extend_from_slice(trailing_dims);
-    let n = validate_shape_with_dynamic_batch(field_name, &shape, &expected)?;
-    Ok((values, n))
-}
-
-fn read_dynamic_action_field<T: npyz::Deserialize>(
-    archive: &mut ZipArchive<BufReader<File>>,
-    field_name: &str,
-    n: usize,
-) -> Result<(Vec<T>, usize), String> {
-    let entry_name = format!("{field_name}.npy");
-    let (values, shape) = read_npy_array::<T>(archive, &entry_name)?;
-    if shape.len() != 2 {
+    if shape != expected.as_slice() {
         return Err(format!(
-            "{} has rank {}, expected rank 2",
-            field_name,
-            shape.len()
+            "{} has shape {:?}, expected {:?}",
+            field_name, shape, expected
         ));
     }
-    if shape[0] != n as u64 {
-        return Err(format!(
-            "{} has inconsistent batch dimension: {} vs {}",
-            field_name, shape[0], n
-        ));
-    }
-    Ok((values, shape[1] as usize))
+    Ok(())
 }
 
-fn read_batch_field<T: npyz::Deserialize>(
-    archive: &mut ZipArchive<BufReader<File>>,
+/// Stream `field_name` row by row (row = product of `trailing_dims` elements).
+fn for_each_row<T: npyz::Deserialize + Default + Clone>(
+    archive: &mut Archive,
     field_name: &str,
     n: usize,
     trailing_dims: &[u64],
-) -> Result<Vec<T>, String> {
-    let entry_name = format!("{field_name}.npy");
-    let (values, shape) = read_npy_array::<T>(archive, &entry_name)?;
-    validate_batch_shape(field_name, &shape, n, trailing_dims)?;
-    Ok(values)
+    mut visit: impl FnMut(usize, &[T]),
+) -> Result<(), String> {
+    let npy = open_npy(archive, field_name)?;
+    check_batch_shape(field_name, npy.shape(), n, trailing_dims)?;
+    let width = trailing_dims.iter().product::<u64>() as usize;
+    let reader = npy.data::<T>().map_err(|e| format!("{field_name}: {e}"))?;
+    stream_rows(reader, field_name, width, &mut visit)
 }
 
-fn read_dynamic_bool_action_field(
-    archive: &mut ZipArchive<BufReader<File>>,
+fn stream_rows<T: Default + Clone>(
+    values: impl Iterator<Item = std::io::Result<T>>,
+    field_name: &str,
+    width: usize,
+    visit: &mut impl FnMut(usize, &[T]),
+) -> Result<(), String> {
+    let mut row = vec![T::default(); width];
+    let mut filled = 0;
+    let mut row_index = 0;
+    for value in values {
+        row[filled] = value.map_err(|e| format!("{field_name}: {e}"))?;
+        filled += 1;
+        if filled == width {
+            visit(row_index, &row);
+            row_index += 1;
+            filled = 0;
+        }
+    }
+    Ok(())
+}
+
+/// Stream a uint8- or bool-typed field as `u8` rows of `width` elements.
+fn for_each_bool_like_row(
+    archive: &mut Archive,
     field_name: &str,
     n: usize,
-) -> Result<(Vec<u8>, usize), String> {
-    let entry_name = format!("{field_name}.npy");
-    let (values, shape) = read_npy_array_bool_like(archive, &entry_name)?;
-    if shape.len() != 2 {
-        return Err(format!(
-            "{} has rank {}, expected rank 2",
-            field_name,
-            shape.len()
-        ));
+    width: usize,
+    mut visit: impl FnMut(usize, &[u8]),
+) -> Result<(), String> {
+    let trailing: &[u64] = if width == 1 { &[] } else { &[width as u64] };
+    let npy = open_npy(archive, field_name)?;
+    check_batch_shape(field_name, npy.shape(), n, trailing)?;
+    match npy.try_data::<u8>() {
+        Ok(reader) => stream_rows(reader, field_name, width, &mut visit),
+        Err(npy) => {
+            let reader = npy
+                .data::<bool>()
+                .map_err(|e| format!("{field_name}: {e}"))?
+                .map(|value| value.map(u8::from));
+            stream_rows(reader, field_name, width, &mut visit)
+        }
     }
-    if shape[0] != n as u64 {
-        return Err(format!(
-            "{} has inconsistent batch dimension: {} vs {}",
-            field_name, shape[0], n
-        ));
-    }
-    Ok((values, shape[1] as usize))
 }
 
-fn read_bool_like_batch_field(
-    archive: &mut ZipArchive<BufReader<File>>,
+fn for_each_bool_like(
+    archive: &mut Archive,
     field_name: &str,
     n: usize,
-    trailing_dims: &[u64],
-) -> Result<Vec<u8>, String> {
-    let entry_name = format!("{field_name}.npy");
-    let (values, shape) = read_npy_array_bool_like(archive, &entry_name)?;
-    validate_batch_shape(field_name, &shape, n, trailing_dims)?;
-    Ok(values)
+    mut visit: impl FnMut(usize, bool),
+) -> Result<(), String> {
+    for_each_bool_like_row(archive, field_name, n, 1, |i, row| visit(i, row[0] != 0))
 }
 
-fn read_npy_array<T: npyz::Deserialize>(
-    archive: &mut ZipArchive<BufReader<File>>,
-    entry_name: &str,
-) -> Result<(Vec<T>, Vec<u64>), String> {
-    let file = archive.by_name(entry_name).map_err(|e| e.to_string())?;
-    let npy = NpyFile::new(file).map_err(|e| e.to_string())?;
-    let shape = npy.shape().to_vec();
-    let values = npy.into_vec::<T>().map_err(|e| e.to_string())?;
-    Ok((values, shape))
-}
-
-fn read_npy_array_bool_like(
-    archive: &mut ZipArchive<BufReader<File>>,
-    entry_name: &str,
-) -> Result<(Vec<u8>, Vec<u64>), String> {
-    if let Ok((values, shape)) = read_npy_array::<u8>(archive, entry_name) {
-        return Ok((values, shape));
-    }
-
-    let (values, shape) = read_npy_array::<bool>(archive, entry_name)?;
-    Ok((values.into_iter().map(u8::from).collect(), shape))
-}
-
-fn write_example_scalar_field<T: npyz::Serialize + npyz::AutoSerialize>(
+fn write_scalar_field<T: npyz::Serialize + npyz::AutoSerialize>(
     zip: &mut ZipWriter<BufWriter<File>>,
     options: FileOptions,
     name: &str,
     n: u64,
     data: impl Iterator<Item = T>,
 ) -> Result<(), String> {
-    write_example_flat_field(zip, options, name, n, &[], data)
+    write_flat_field(zip, options, name, n, &[], data)
 }
 
-fn write_example_flat_field<T: npyz::Serialize + npyz::AutoSerialize>(
+fn write_flat_field<T: npyz::Serialize + npyz::AutoSerialize>(
     zip: &mut ZipWriter<BufWriter<File>>,
     options: FileOptions,
     name: &str,
@@ -706,30 +661,22 @@ fn write_example_flat_field<T: npyz::Serialize + npyz::AutoSerialize>(
     let mut shape = Vec::with_capacity(trailing_dims.len() + 1);
     shape.push(n);
     shape.extend_from_slice(trailing_dims);
-    stream_npy_to_zip(zip, options, name, &shape, data)
-}
-
-/// Stream an npy array directly to a zip entry without intermediate buffers.
-fn stream_npy_to_zip<T: npyz::Serialize + npyz::AutoSerialize>(
-    zip: &mut ZipWriter<BufWriter<File>>,
-    options: FileOptions,
-    name: &str,
-    shape: &[u64],
-    data: impl Iterator<Item = T>,
-) -> Result<(), String> {
     zip.start_file(name, options)
         .map_err(|e: zip::result::ZipError| e.to_string())?;
-
+    // npyz issues one small write per element; feeding those straight into the
+    // deflate encoder made a 5M-example snapshot take tens of minutes.
+    let mut buffered = BufWriter::with_capacity(1 << 20, &mut *zip);
     let mut writer = npyz::WriteOptions::new()
         .default_dtype()
-        .shape(shape)
-        .writer(&mut *zip)
+        .shape(&shape)
+        .writer(&mut buffered)
         .begin_nd()
         .map_err(|e: std::io::Error| e.to_string())?;
     writer
         .extend(data)
         .map_err(|e: std::io::Error| e.to_string())?;
     writer.finish().map_err(|e: std::io::Error| e.to_string())?;
+    buffered.flush().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -741,7 +688,7 @@ mod tests {
     };
     use crate::game::constants::ROW_FILL_FEATURE_ROWS;
     use crate::runtime::test_utils;
-    use crate::search::NUM_ACTIONS;
+    use crate::search::{TrainingExample, NUM_ACTIONS};
     use std::fs;
     use std::path::PathBuf;
 
@@ -790,45 +737,34 @@ mod tests {
         }
     }
 
+    fn compact(examples: &[TrainingExample]) -> Vec<CompactExample> {
+        examples.iter().map(CompactExample::from_example).collect()
+    }
+
     #[test]
     fn test_npz_round_trip_preserves_examples() {
         let path = unique_temp_path("roundtrip");
-        let examples = vec![make_example(0, 7, 3), make_example(88, 5, 3)];
+        let examples = compact(&[make_example(0, 7, 3), make_example(88, 5, 3)]);
 
         write_examples_to_npz(&path, &examples).expect("write should succeed");
         let loaded = read_examples_from_npz(&path).expect("read should succeed");
         fs::remove_file(&path).expect("temp file cleanup should succeed");
 
-        assert_eq!(loaded.len(), examples.len());
-        for (expected, actual) in examples.iter().zip(loaded.iter()) {
-            assert_eq!(actual.board, expected.board);
-            assert_eq!(actual.current_piece, expected.current_piece);
-            assert_eq!(actual.hold_piece, expected.hold_piece);
-            assert_eq!(actual.hold_available, expected.hold_available);
-            assert_eq!(actual.next_queue, expected.next_queue);
-            assert_eq!(actual.move_number, expected.move_number);
-            assert_eq!(actual.placement_count, expected.placement_count);
-            assert_eq!(actual.combo, expected.combo);
-            assert_eq!(actual.back_to_back, expected.back_to_back);
-            assert_eq!(
-                actual.next_hidden_piece_probs,
-                expected.next_hidden_piece_probs
-            );
-            assert_eq!(actual.column_heights, expected.column_heights);
-            assert_eq!(actual.max_column_height, expected.max_column_height);
-            assert_eq!(actual.row_fill_counts, expected.row_fill_counts);
-            assert_eq!(actual.total_blocks, expected.total_blocks);
-            assert_eq!(actual.bumpiness, expected.bumpiness);
-            assert_eq!(actual.holes, expected.holes);
-            assert_eq!(actual.value, expected.value);
-            assert_eq!(actual.policy.len(), expected.policy.len());
-            assert_eq!(actual.action_mask, expected.action_mask);
-            assert_eq!(actual.overhang_fields, expected.overhang_fields);
-            assert_eq!(actual.game_number, expected.game_number);
-            assert_eq!(actual.game_total_attack, expected.game_total_attack);
-            assert_eq!(actual.policy[0], expected.policy[0]);
-            assert_eq!(actual.policy[13], expected.policy[13]);
-        }
+        assert_eq!(loaded, examples);
+    }
+
+    #[test]
+    fn test_npz_round_trip_keeps_short_queue() {
+        let path = unique_temp_path("short_queue");
+        let mut example = make_example(3, 7, 0);
+        example.next_queue = vec![4, 1];
+        let examples = compact(&[example]);
+
+        write_examples_to_npz(&path, &examples).expect("write should succeed");
+        let loaded = read_examples_from_npz(&path).expect("read should succeed");
+        fs::remove_file(&path).expect("temp file cleanup should succeed");
+
+        assert_eq!(loaded[0].next_queue_pieces(), vec![4, 1]);
     }
 
     #[test]
@@ -844,7 +780,7 @@ mod tests {
 
         let path = unique_temp_path("combo_normalized");
         // combo normalization is uncapped linear scaling.
-        let examples = vec![make_example(0, 7, 99)];
+        let examples = compact(&[make_example(0, 7, 99)]);
 
         write_examples_to_npz(&path, &examples).expect("write should succeed");
         let loaded = read_examples_from_npz(&path).expect("read should succeed");
@@ -857,8 +793,8 @@ mod tests {
     #[test]
     fn test_npz_slices_round_trip() {
         let path = unique_temp_path("slices_roundtrip");
-        let examples_a = vec![make_example(0, 7, 3)];
-        let examples_b = vec![make_example(88, 5, 3)];
+        let examples_a = compact(&[make_example(0, 7, 3)]);
+        let examples_b = compact(&[make_example(88, 5, 3)]);
 
         write_examples_slices_to_npz(&path, &examples_a, &examples_b)
             .expect("write should succeed");
@@ -868,6 +804,61 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].move_number, 0);
         assert_eq!(loaded[1].move_number, 88);
+    }
+
+    /// Dense snapshots written before the compact format must still load.
+    #[test]
+    fn test_reads_dense_policy_snapshot() {
+        let path = unique_temp_path("dense_snapshot");
+        let examples = vec![make_example(0, 7, 3), make_example(9, 2, 1)];
+        write_dense_npz(&path, &examples);
+        let loaded = read_examples_from_npz(&path).expect("dense read should succeed");
+        fs::remove_file(&path).expect("temp file cleanup should succeed");
+
+        assert_eq!(loaded, compact(&examples));
+    }
+
+    fn write_dense_npz(path: &Path, examples: &[TrainingExample]) {
+        write_examples_to_npz(path, &compact(examples)).expect("write should succeed");
+        // Rewrite the archive with dense policy_targets/action_masks instead of the compact fields.
+        let source = fs::read(path).expect("read back");
+        let mut reader = ZipArchive::new(std::io::Cursor::new(source)).expect("zip");
+        let out = File::create(path).expect("create");
+        let mut zip = ZipWriter::new(BufWriter::new(out));
+        let options = FileOptions::default().compression_method(CompressionMethod::Stored);
+        for index in 0..reader.len() {
+            let mut entry = reader.by_index(index).expect("entry");
+            let name = entry.name().to_string();
+            if name == "policy_legal.npy" || name == "action_mask_bits.npy" {
+                continue;
+            }
+            let mut bytes = Vec::new();
+            std::io::copy(&mut entry, &mut bytes).expect("copy");
+            zip.start_file(name, options).expect("start");
+            std::io::Write::write_all(&mut zip, &bytes).expect("write");
+        }
+        let n = examples.len() as u64;
+        write_flat_field(
+            &mut zip,
+            options,
+            "policy_targets.npy",
+            n,
+            &[NUM_ACTIONS as u64],
+            examples.iter().flat_map(|ex| ex.policy.iter().copied()),
+        )
+        .expect("policy");
+        write_flat_field(
+            &mut zip,
+            options,
+            "action_masks.npy",
+            n,
+            &[NUM_ACTIONS as u64],
+            examples
+                .iter()
+                .flat_map(|ex| ex.action_mask.iter().map(|&m| m as u8)),
+        )
+        .expect("masks");
+        zip.finish().expect("finish");
     }
 
     #[test]

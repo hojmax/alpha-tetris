@@ -31,6 +31,7 @@ from tetris_bot.ml.network import (
     ROW_FILL_COUNT_FEATURES,
 )
 from tetris_bot.ml.optimizer import OptimizerBundle
+from tetris_bot.ml.replay_npz import ReplayArchive, open_replay_npz
 
 logger = structlog.get_logger()
 
@@ -173,7 +174,7 @@ class OfflineTensorDataset:
 
 @dataclass
 class OfflineDataSource:
-    npz: np.lib.npyio.NpzFile
+    npz: ReplayArchive
     selected_global_indices: np.ndarray
     tensor_data: OfflineTensorDataset | None
 
@@ -576,13 +577,13 @@ def validate_args(args: ScriptArgs) -> None:
         raise ValueError("cache_hit_rate_for_matching must be in [0, 1]")
 
 
-def ensure_required_keys(data: np.lib.npyio.NpzFile) -> None:
+def ensure_required_keys(data: ReplayArchive) -> None:
     missing = [key for key in REQUIRED_NPZ_KEYS if key not in data]
     if missing:
         raise KeyError(f"NPZ is missing required keys: {missing}")
 
 
-def validate_shapes(data: np.lib.npyio.NpzFile) -> int:
+def validate_shapes(data: ReplayArchive) -> int:
     n = int(data["boards"].shape[0])
     if data["boards"].shape[1:] != (BOARD_HEIGHT, BOARD_WIDTH):
         raise ValueError(
@@ -664,7 +665,7 @@ def get_preload_mode(args: _PreloadArgs) -> str:
 
 
 def build_aux_batch_from_npz(
-    data: np.lib.npyio.NpzFile,
+    data: ReplayArchive,
     global_indices: np.ndarray,
     current_pieces: np.ndarray | None = None,
 ) -> np.ndarray:
@@ -757,7 +758,7 @@ def normalize_policy_arrays(
 
 
 def build_torch_batch_from_npz(
-    data: np.lib.npyio.NpzFile,
+    data: ReplayArchive,
     global_indices: np.ndarray,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -786,7 +787,7 @@ def build_torch_batch_from_npz(
 
 
 def build_tensor_dataset(
-    data: np.lib.npyio.NpzFile,
+    data: ReplayArchive,
     selected_global_indices: np.ndarray,
     mode: str,
     train_device: torch.device,
@@ -908,7 +909,7 @@ def validate_common_offline_args(args: _OfflineScriptArgs) -> None:
 
 
 def setup_offline_dataset(
-    npz: np.lib.npyio.NpzFile,
+    npz: ReplayArchive,
     seed: int,
     max_examples: int,
     train_fraction: float,
@@ -1324,7 +1325,7 @@ def main(args: ScriptArgs) -> None:
     wandb.define_metric("baseline/*", step_metric="offline_step")
     wandb.define_metric("gated/*", step_metric="offline_step")
 
-    npz = np.load(args.data_path, mmap_mode="r")
+    npz = open_replay_npz(args.data_path, mmap_mode="r")
     try:
         setup = setup_offline_dataset(
             npz=npz,

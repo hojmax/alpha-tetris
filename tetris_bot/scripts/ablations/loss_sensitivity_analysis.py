@@ -55,6 +55,7 @@ from tetris_bot.scripts.ablations.compare_offline_architectures import (
     validate_shapes,
 )
 from tetris_bot.scripts.utils.eval_utils import compute_attack_stats
+from tetris_bot.ml.replay_npz import open_replay_npz
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -1022,7 +1023,7 @@ def main(args: ScriptArgs) -> None:
         model_source=model_source,
     )
 
-    npz = np.load(data_path, mmap_mode="r")
+    npz = open_replay_npz(data_path, mmap_mode="r")
     try:
         ensure_required_keys(npz)
         total_examples = validate_shapes(npz)
