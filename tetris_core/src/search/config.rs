@@ -64,6 +64,11 @@ pub struct MCTSConfig {
     /// (clamped to `num_simulations`), so root noise still influences every search.
     #[pyo3(get, set)]
     pub min_new_simulations: u32,
+    /// Softmax temperature applied to the network's policy prior before it enters PUCT
+    /// (priors become `softmax(logits / policy_temperature)`). 1.0 leaves the prior unchanged;
+    /// values above 1 flatten it. Search-time only: training targets are unaffected.
+    #[pyo3(get, set)]
+    pub policy_temperature: f32,
     /// Mean of Gaussian noise added independently to each policy logit before masking/softmax.
     #[pyo3(get, set)]
     pub policy_noise_mean: f32,
@@ -105,6 +110,7 @@ impl MCTSConfig {
             reuse_tree: true,
             count_reused_visits: false,
             min_new_simulations: 0,
+            policy_temperature: 1.0,
             policy_noise_mean: 0.0,
             policy_noise_std: 0.0,
             value_noise_mean: 0.0,

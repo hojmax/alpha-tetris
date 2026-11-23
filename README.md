@@ -34,6 +34,10 @@ Instead of predicting win probability as in the original AlphaZero paper (AlphaZ
 
 Since Tetris is stochastic, unlike Go or Chess, I add chance nodes (over possible next pieces in the queue) to the tree and randomly visit one when descending. The Q value thus becomes an estimate of the expected attack over possible future queues.
 
+During training I also do left-right data augmentation: each training batch is mirrored with probability 0.5. Mirroring a Tetris position gives another valid position whose best move is the mirror of the original's, as long as you flip the board and swap the pieces that become each other under reflection (S with Z, J with L) in the current piece, hold and queue. The policy target is mirrored the same way.
+
+![](docs/mirror_augmentation.png)
+
 Here are some metrics related to the play style of the agent and how they evolved over training:
 
 ![](docs/play_style.png)

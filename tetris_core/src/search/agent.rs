@@ -839,11 +839,7 @@ impl MCTSAgent {
             let (result, root, tree_stats, traversal_stats, q_bounds) = if let Some(root) =
                 reused_root
             {
-                let evaluator = super::search::NeuralLeafEvaluator {
-                    nn,
-                    nn_value_weight: self.config.nn_value_weight,
-                    prediction_noise: prediction_noise_from_config(&self.config),
-                };
+                let evaluator = super::search::neural_leaf_evaluator(&self.config, nn);
                 run_search(&self.config, &evaluator, root, add_noise)
             } else {
                 let (policy, nn_value) = match nn.predict_masked(

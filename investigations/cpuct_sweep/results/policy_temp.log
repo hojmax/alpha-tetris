@@ -1,0 +1,34 @@
+2026-11-23 20:41:23 [info     ] point done                     avg_attack=57.73 c_puct=1.0 policy_temperature=0.8 seconds=20.2 sem=0.4 sims=500
+2026-11-23 20:41:44 [info     ] point done                     avg_attack=58.02 c_puct=1.5 policy_temperature=0.8 seconds=21.2 sem=0.37 sims=500
+2026-11-23 20:42:04 [info     ] point done                     avg_attack=57.45 c_puct=2.5 policy_temperature=0.8 seconds=20.0 sem=0.4 sims=500
+2026-11-23 20:42:31 [info     ] point done                     avg_attack=57.42 c_puct=1.0 policy_temperature=1.0 seconds=26.4 sem=0.43 sims=500
+2026-11-23 20:42:56 [info     ] point done                     avg_attack=57.92 c_puct=1.5 policy_temperature=1.0 seconds=24.9 sem=0.37 sims=500
+2026-11-23 20:43:20 [info     ] point done                     avg_attack=57.6 c_puct=2.5 policy_temperature=1.0 seconds=24.1 sem=0.42 sims=500
+2026-11-23 20:43:50 [info     ] point done                     avg_attack=57.67 c_puct=1.0 policy_temperature=1.3 seconds=29.9 sem=0.38 sims=500
+2026-11-23 20:44:20 [info     ] point done                     avg_attack=57.63 c_puct=1.5 policy_temperature=1.3 seconds=30.5 sem=0.4 sims=500
+Failed to load model: No such file or directory (os error 2)
+Failed to load model: No such file or directory (os error 2)
+Failed to load model: No such file or directory (os error 2)Traceback (most recent call last):
+
+  File "/Users/axelhojmark/alpha-tetris/investigations/cpuct_sweep/sweep.py", line 125, in <module>
+Failed to load model: No such file or directory (os error 2)
+Failed to load model: No such file or directory (os error 2)
+    main(parse(Args))
+Failed to load model: No such file or directory (os error 2)
+  File "/Users/axelhojmark/alpha-tetris/investigations/cpuct_sweep/sweep.py", line 88, in main
+Failed to load model: No such file or directory (os error 2)
+    result = evaluate_model(
+Failed to load model:              ^^^^^^^^^^^^^^^
+No such file or directory (os error 2)
+OSError: Failed to load model from /Users/axelhojmark/alpha-tetris/training_runs/new_run_plus_deterministic/final_weights/sync_step_3505140.onnx
+Failed to load model: No such file or directory (os error 2)
+Failed to load model: No such file or directory (os error 2)
+Failed to load model: No such file or directory (os error 2)
+Failed to load model: No such file or directory (os error 2)
+Failed to load model: No such file or directory (os error 2)
+Failed to load model: No such file or directory (os error 2)
+Failed to load model: No such file or directory (os error 2)
+Failed to load model: No such file or directory (os error 2)
+2026-11-23 20:45:05 [info     ] point done                     avg_attack=57.86 c_puct=2.5 policy_temperature=1.3 seconds=25.2 sem=0.37 sims=500
+2026-11-23 20:45:38 [info     ] point done                     avg_attack=57.03 c_puct=1.0 policy_temperature=1.6 seconds=33.4 sem=0.44 sims=500
+2026-11-23 20:46:11 [info     ] point done                     avg_attack=57.02 c_puct=1.5 policy_temperature=1.6 seconds=32.6 sem=0.4 sims=500

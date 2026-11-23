@@ -66,6 +66,34 @@ fn scale_nn_value(value: f32, nn_value_weight: f32) -> f32 {
     value * nn_value_weight
 }
 
+/// Re-temper a probability vector in place: `p^(1/T)` renormalised, which equals
+/// `softmax(logits / T)` for `p = softmax(logits)`. Zero entries (masked actions) stay zero.
+pub(super) fn apply_policy_temperature(policy: &mut [f32], temperature: f32) {
+    assert!(
+        temperature > 0.0 && temperature.is_finite(),
+        "policy_temperature must be positive and finite (got {temperature})"
+    );
+    if temperature == 1.0 {
+        return;
+    }
+    let max = policy.iter().copied().fold(0.0f32, f32::max);
+    if max <= 0.0 {
+        return;
+    }
+    // Work relative to the max so p^(1/T) cannot underflow for the top action.
+    let exponent = 1.0 / temperature;
+    let mut sum = 0.0;
+    for p in policy.iter_mut() {
+        if *p > 0.0 {
+            *p = (*p / max).powf(exponent);
+            sum += *p;
+        }
+    }
+    for p in policy.iter_mut() {
+        *p /= sum;
+    }
+}
+
 fn action_reveals_new_visible_piece(state: &TetrisEnv, action_idx: usize) -> bool {
     if action_idx != HOLD_ACTION_INDEX {
         return true;
@@ -95,6 +123,7 @@ pub(super) struct LeafEvaluation {
 pub(super) struct NeuralLeafEvaluator<'a> {
     pub(super) nn: &'a TetrisNN,
     pub(super) nn_value_weight: f32,
+    pub(super) policy_temperature: f32,
     pub(super) prediction_noise: PredictionNoiseSettings,
 }
 
@@ -111,11 +140,14 @@ impl LeafEvaluator for NeuralLeafEvaluator<'_> {
             max_placements as usize,
             self.prediction_noise,
         ) {
-            Ok((policy, value)) => Ok(LeafEvaluation {
-                action_priors: policy,
-                raw_value: value,
-                value: scale_nn_value(value, self.nn_value_weight),
-            }),
+            Ok((mut policy, value)) => {
+                apply_policy_temperature(&mut policy, self.policy_temperature);
+                Ok(LeafEvaluation {
+                    action_priors: policy,
+                    raw_value: value,
+                    value: scale_nn_value(value, self.nn_value_weight),
+                })
+            }
             Err(error) => Err(format!(
                 "NN prediction failed during expansion at move {}: {}",
                 state.placement_count, error
@@ -685,10 +717,14 @@ pub(super) fn search_internal(
     run_search(config, &evaluator, root, add_noise)
 }
 
-fn neural_leaf_evaluator<'a>(config: &MCTSConfig, nn: &'a TetrisNN) -> NeuralLeafEvaluator<'a> {
+pub(super) fn neural_leaf_evaluator<'a>(
+    config: &MCTSConfig,
+    nn: &'a TetrisNN,
+) -> NeuralLeafEvaluator<'a> {
     NeuralLeafEvaluator {
         nn,
         nn_value_weight: config.nn_value_weight,
+        policy_temperature: config.policy_temperature,
         prediction_noise: PredictionNoiseSettings {
             policy_mean: config.policy_noise_mean,
             policy_std: config.policy_noise_std,
@@ -706,8 +742,10 @@ fn neural_root(
     nn_value: f32,
 ) -> DecisionNode {
     let mut root = DecisionNode::new(env.clone());
+    let mut policy = policy.to_vec();
+    apply_policy_temperature(&mut policy, config.policy_temperature);
     root.set_nn_output_with_raw(
-        policy,
+        &policy,
         nn_value,
         scale_nn_value(nn_value, config.nn_value_weight),
     );
@@ -825,6 +863,27 @@ mod tests {
     use crate::game::action_space::HOLD_ACTION_INDEX;
 
     use super::*;
+
+    #[test]
+    fn test_apply_policy_temperature_matches_scaled_logit_softmax() {
+        let logits = [2.0f32, 0.5, -1.0, 0.0];
+        let softmax = |scale: f32| {
+            let exps: Vec<f32> = logits.iter().map(|l| (l * scale).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            exps.iter().map(|e| e / sum).collect::<Vec<f32>>()
+        };
+        for temperature in [0.5f32, 1.0, 2.0] {
+            // Masked action (0.0) must stay exactly zero.
+            let mut policy = softmax(1.0);
+            policy.push(0.0);
+            apply_policy_temperature(&mut policy, temperature);
+            let expected = softmax(1.0 / temperature);
+            for (got, want) in policy.iter().zip(expected.iter()) {
+                assert!((got - want).abs() < 1e-6, "T={temperature}: {got} vs {want}");
+            }
+            assert_eq!(policy[4], 0.0);
+        }
+    }
 
     fn simulate_once<E: LeafEvaluator>(
         config: &MCTSConfig,
