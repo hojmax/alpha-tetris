@@ -2,7 +2,7 @@
 
 This repo implements a superhuman RL policy for Tetris, based on AlphaZero-style MCTS. A neural network guides a Monte Carlo Tree Search and is trained on the games it generates.
 
-I had been really curious about the AlphaGo algorithm ever since I learned years ago about it beating the world champion in Go (I remember [Robert Miles's](https://www.youtube.com/watch?v=v9M2Ho9I9Qo) excellent video on the topic). The idea of applying it to my all-time favourite game Tetris kept coming back to me (I used to play a lot of Tetris when I was younger), so I finally decided to give it a go. It was quite fun and a nice challenge.
+I had been really curious about the AlphaGo algorithm ever since I learned years ago about it beating the world champion in Go (I remember [Robert Miles's](https://www.youtube.com/watch?v=v9M2Ho9I9Qo) excellent video on the topic). The idea of applying it to my all-time favourite game Tetris kept coming back to me (I used to play a lot of Tetris when I was younger), so I finally decided to give it a go.
 
 The Tetris environment, MCTS, and inference are in Rust. The training loop is in Python.
 
