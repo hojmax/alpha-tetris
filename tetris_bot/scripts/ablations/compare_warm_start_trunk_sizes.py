@@ -487,6 +487,7 @@ def build_benchmark_config(
     config.use_parent_value_for_unvisited_q = (
         source_config.self_play.use_parent_value_for_unvisited_q
     )
+    config.fpu_reduction = source_config.self_play.fpu_reduction
     config.nn_value_weight = 1.0
     config.death_penalty = 0.0
     config.overhang_penalty_weight = 0.0

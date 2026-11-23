@@ -47,6 +47,12 @@ pub struct MCTSConfig {
     /// total-value estimate instead of zero Q (first-play urgency).
     #[pyo3(get, set)]
     pub use_parent_value_for_unvisited_q: bool,
+    /// First-play-urgency reduction (Leela-style), used with
+    /// `use_parent_value_for_unvisited_q`: an unvisited child's normalized Q is the
+    /// parent's normalized estimate minus `fpu_reduction * sqrt(prior mass of visited
+    /// children)`. 0.0 keeps the plain parent-value initialization.
+    #[pyo3(get, set)]
+    pub fpu_reduction: f32,
     /// Reuse the MCTS subtree from the previous move instead of building a fresh tree.
     /// After selecting an action, the subtree corresponding to that action + actual piece
     /// spawn is extracted and used as the starting point for the next search.
@@ -107,6 +113,7 @@ impl MCTSConfig {
             overhang_penalty_weight: 0.0,
             nn_value_weight: 1.0,
             use_parent_value_for_unvisited_q: false,
+            fpu_reduction: 0.0,
             reuse_tree: true,
             count_reused_visits: false,
             min_new_simulations: 0,

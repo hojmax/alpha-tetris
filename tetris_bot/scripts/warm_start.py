@@ -1473,6 +1473,7 @@ def run_warm_start(
         mcts_config.use_parent_value_for_unvisited_q = (
             eval_config.use_parent_value_for_unvisited_q
         )
+        mcts_config.fpu_reduction = eval_config.fpu_reduction
         mcts_config.nn_value_weight = (
             resolved_output_config.self_play.nn_value_weight_schedule.initial
         )

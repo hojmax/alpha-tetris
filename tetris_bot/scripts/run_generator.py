@@ -94,6 +94,7 @@ def _build_mcts_config(self_play: SelfPlayConfig) -> MCTSConfig:
     cfg.overhang_penalty_weight = self_play.penalty_schedule.overhang_penalty_weight
     cfg.nn_value_weight = self_play.nn_value_weight_schedule.initial
     cfg.use_parent_value_for_unvisited_q = self_play.use_parent_value_for_unvisited_q
+    cfg.fpu_reduction = self_play.fpu_reduction
     cfg.reuse_tree = self_play.reuse_tree
     cfg.count_reused_visits = self_play.count_reused_visits
     cfg.min_new_simulations = self_play.min_new_simulations

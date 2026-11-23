@@ -173,24 +173,37 @@ impl DecisionNode {
         c_puct: f32,
         q_bounds: (f32, f32),
         use_parent_value_for_unvisited_q: bool,
+        fpu_reduction: f32,
     ) -> usize {
         let sqrt_total = (self.visit_count as f32).sqrt();
         let mut best_position = 0;
         let mut best_action = self.valid_actions[0];
         let mut best_value = f32::NEG_INFINITY;
-        let unvisited_q = if use_parent_value_for_unvisited_q {
-            self.initial_total_value_estimate
+        let unvisited_transformed_q = if use_parent_value_for_unvisited_q {
+            let parent_q =
+                normalize_q_value(self.initial_total_value_estimate, q_bounds.0, q_bounds.1);
+            if fpu_reduction == 0.0 {
+                parent_q
+            } else {
+                let visited_prior_mass: f32 = (0..self.valid_actions.len())
+                    .filter(|&position| self.child(position).is_some_and(|c| c.visit_count > 0))
+                    .map(|position| self.action_priors[position])
+                    .sum();
+                parent_q - fpu_reduction * visited_prior_mass.sqrt()
+            }
         } else {
-            0.0
+            normalize_q_value(0.0, q_bounds.0, q_bounds.1)
         };
 
         for (position, &action_idx) in self.valid_actions.iter().enumerate() {
             let prior = self.action_priors[position];
-            let (q, n) = match self.child(position) {
-                Some(child) => (child.mean_value(), child.visit_count),
-                None => (unvisited_q, 0),
+            let (transformed_q, n) = match self.child(position) {
+                Some(child) => (
+                    normalize_q_value(child.mean_value(), q_bounds.0, q_bounds.1),
+                    child.visit_count,
+                ),
+                None => (unvisited_transformed_q, 0),
             };
-            let transformed_q = normalize_q_value(q, q_bounds.0, q_bounds.1);
             let u = c_puct * prior * sqrt_total / (1.0 + n as f32);
             let value = transformed_q + u;
 
@@ -579,7 +592,8 @@ mod tests {
         node.set_nn_output(&policy, 0.0);
 
         // With no bounds yet, all Q values normalize to 0.5 and prior+U wins.
-        let position = node.select_action_position(1.0, (f32::INFINITY, f32::NEG_INFINITY), false);
+        let position =
+            node.select_action_position(1.0, (f32::INFINITY, f32::NEG_INFINITY), false, 0.0);
         assert!(position < node.valid_actions.len());
     }
 
@@ -600,7 +614,7 @@ mod tests {
         node.set_child_for_action(action_idx, child);
 
         // Selection should consider the child's value
-        let position = node.select_action_position(1.0, (0.0, 2.0), false);
+        let position = node.select_action_position(1.0, (0.0, 2.0), false, 0.0);
         assert!(position < node.valid_actions.len());
     }
 
@@ -615,7 +629,7 @@ mod tests {
         node.set_nn_output_for_valid_actions(&[0.5, 0.5], 0.0);
         node.visit_count = 4;
 
-        let position = node.select_action_position(1.0, (0.0, 1.0), false);
+        let position = node.select_action_position(1.0, (0.0, 1.0), false, 0.0);
         assert_eq!(node.valid_actions[position], low_action);
     }
 
@@ -810,7 +824,8 @@ mod tests {
         node.visit_count = 1;
 
         // With high c_puct, should explore high-prior actions
-        let position = node.select_action_position(10.0, (f32::INFINITY, f32::NEG_INFINITY), false);
+        let position =
+            node.select_action_position(10.0, (f32::INFINITY, f32::NEG_INFINITY), false, 0.0);
         assert!(position < node.valid_actions.len());
     }
 
@@ -847,7 +862,7 @@ mod tests {
 
         // Raw-Q PUCT would choose high_q_action; global min-max normalized-Q PUCT
         // should let the strong prior/exploration term win here.
-        let position = node.select_action_position(1.0, (100.0, 200.0), false);
+        let position = node.select_action_position(1.0, (100.0, 200.0), false, 0.0);
         assert_eq!(node.valid_actions[position], high_prior_action);
     }
 
@@ -878,7 +893,7 @@ mod tests {
 
         // Global min-max normalization also compresses this large Q gap into [0, 1],
         // so the strong prior/exploration term should dominate this comparison.
-        let position = node.select_action_position(1.0, (100.0, 200.0), false);
+        let position = node.select_action_position(1.0, (100.0, 200.0), false, 0.0);
         assert_eq!(node.valid_actions[position], high_prior_action);
     }
 
@@ -903,11 +918,16 @@ mod tests {
         visited_child.value_sum = 0.0;
         node.set_child_for_action(visited_action, visited_child);
 
-        let without_parent_value = node.select_action_position(1.0, (0.0, 16.0), false);
-        let with_parent_value = node.select_action_position(1.0, (0.0, 16.0), true);
+        let without_parent_value = node.select_action_position(1.0, (0.0, 16.0), false, 0.0);
+        let with_parent_value = node.select_action_position(1.0, (0.0, 16.0), true, 0.0);
 
         assert_eq!(node.valid_actions[without_parent_value], visited_action);
         assert_eq!(node.valid_actions[with_parent_value], unvisited_action);
+
+        // A large FPU reduction (scaled by sqrt of the visited prior mass, 0.99) pushes the
+        // unvisited child's start value below the visited one again.
+        let with_reduction = node.select_action_position(1.0, (0.0, 16.0), true, 2.0);
+        assert_eq!(node.valid_actions[with_reduction], visited_action);
     }
 
     #[test]

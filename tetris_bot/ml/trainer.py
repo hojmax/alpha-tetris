@@ -1512,6 +1512,7 @@ class Trainer:
         mcts_config.use_parent_value_for_unvisited_q = (
             self.config.self_play.use_parent_value_for_unvisited_q
         )
+        mcts_config.fpu_reduction = self.config.self_play.fpu_reduction
         mcts_config.reuse_tree = self.config.self_play.reuse_tree
         mcts_config.count_reused_visits = self.config.self_play.count_reused_visits
         mcts_config.min_new_simulations = self.config.self_play.min_new_simulations

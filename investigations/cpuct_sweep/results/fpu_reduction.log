@@ -1,0 +1,24 @@
+2026-11-23 21:09:07 [info     ] point done                     avg_attack=57.34 c_puct=1.5 fpu_reduction=0.0 policy_temperature=1.0 seconds=12.5 sem=0.41 sims=300
+2026-11-23 21:09:19 [info     ] point done                     avg_attack=57.45 c_puct=1.5 fpu_reduction=0.05 policy_temperature=1.0 seconds=11.5 sem=0.42 sims=300
+2026-11-23 21:09:30 [info     ] point done                     avg_attack=57.34 c_puct=1.5 fpu_reduction=0.1 policy_temperature=1.0 seconds=11.2 sem=0.42 sims=300
+2026-11-23 21:09:40 [info     ] point done                     avg_attack=57.61 c_puct=1.5 fpu_reduction=0.2 policy_temperature=1.0 seconds=10.7 sem=0.39 sims=300
+2026-11-23 21:09:50 [info     ] point done                     avg_attack=57.86 c_puct=1.5 fpu_reduction=0.3 policy_temperature=1.0 seconds=10.1 sem=0.38 sims=300
+2026-11-23 21:10:01 [info     ] point done                     avg_attack=57.29 c_puct=1.5 fpu_reduction=0.5 policy_temperature=1.0 seconds=10.4 sem=0.42 sims=300
+2026-11-23 21:10:20 [info     ] point done                     avg_attack=57.92 c_puct=1.5 fpu_reduction=0.0 policy_temperature=1.0 seconds=19.3 sem=0.37 sims=500
+2026-11-23 21:10:37 [info     ] point done                     avg_attack=58.16 c_puct=1.5 fpu_reduction=0.05 policy_temperature=1.0 seconds=17.1 sem=0.38 sims=500
+2026-11-23 21:10:54 [info     ] point done                     avg_attack=57.9 c_puct=1.5 fpu_reduction=0.1 policy_temperature=1.0 seconds=17.2 sem=0.4 sims=500
+2026-11-23 21:11:10 [info     ] point done                     avg_attack=58.23 c_puct=1.5 fpu_reduction=0.2 policy_temperature=1.0 seconds=15.9 sem=0.38 sims=500
+2026-11-23 21:11:26 [info     ] point done                     avg_attack=58.12 c_puct=1.5 fpu_reduction=0.3 policy_temperature=1.0 seconds=15.7 sem=0.36 sims=500
+2026-11-23 21:11:44 [info     ] point done                     avg_attack=58.34 c_puct=1.5 fpu_reduction=0.5 policy_temperature=1.0 seconds=17.9 sem=0.37 sims=500
+.venv/bin/python: can't open file '/Users/axelhojmark/alpha-tetris/investigations/cpuct_sweep/sweep.py --c_pucts 1.5 --policy_temperatures 1.0 --sims 300 500': [Errno 2] No such file or directory
+.venv/bin/python: can't open file '/Users/axelhojmark/alpha-tetris/investigations/cpuct_sweep/sweep.py --c_pucts 1.5 --policy_temperatures 1.0 --sims 300 500': [Errno 2] No such file or directory
+2026-11-23 21:13:53 [info     ] point done                     avg_attack=57.69 c_puct=1.5 fpu_reduction=0.75 policy_temperature=1.0 seconds=8.4 sem=0.41 sims=300
+2026-11-23 21:14:02 [info     ] point done                     avg_attack=57.29 c_puct=1.5 fpu_reduction=1.0 policy_temperature=1.0 seconds=9.1 sem=0.44 sims=300
+2026-11-23 21:14:17 [info     ] point done                     avg_attack=58.34 c_puct=1.5 fpu_reduction=0.75 policy_temperature=1.0 seconds=14.5 sem=0.34 sims=500
+2026-11-23 21:14:32 [info     ] point done                     avg_attack=58.18 c_puct=1.5 fpu_reduction=1.0 policy_temperature=1.0 seconds=14.8 sem=0.36 sims=500
+2026-11-23 21:14:56 [info     ] point done                     avg_attack=56.98 c_puct=1.5 fpu_reduction=0.0 policy_temperature=1.0 seconds=23.7 sem=0.31 sims=300
+2026-11-23 21:15:15 [info     ] point done                     avg_attack=56.98 c_puct=1.5 fpu_reduction=0.3 policy_temperature=1.0 seconds=19.1 sem=0.32 sims=300
+2026-11-23 21:15:33 [info     ] point done                     avg_attack=57.33 c_puct=1.5 fpu_reduction=0.5 policy_temperature=1.0 seconds=18.7 sem=0.31 sims=300
+2026-11-23 21:16:14 [info     ] point done                     avg_attack=57.67 c_puct=1.5 fpu_reduction=0.0 policy_temperature=1.0 seconds=40.3 sem=0.28 sims=500
+2026-11-23 21:16:44 [info     ] point done                     avg_attack=57.75 c_puct=1.5 fpu_reduction=0.3 policy_temperature=1.0 seconds=30.5 sem=0.28 sims=500
+2026-11-23 21:17:17 [info     ] point done                     avg_attack=57.79 c_puct=1.5 fpu_reduction=0.5 policy_temperature=1.0 seconds=32.7 sem=0.28 sims=500

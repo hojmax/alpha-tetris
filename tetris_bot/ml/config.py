@@ -138,6 +138,11 @@ class SelfPlayConfig(ConfigModel):
     dirichlet_epsilon: float
     add_noise: bool
     use_parent_value_for_unvisited_q: bool
+    # Leela-style first-play-urgency reduction in normalized-Q units, applied with
+    # use_parent_value_for_unvisited_q. 0.5 beat 0.0 by +0.29 +- 0.11 greedy attack on
+    # 1000 fresh seeds at 500 sims (investigations/cpuct_sweep). Default 0.0 keeps older
+    # saved configs on their original behaviour.
+    fpu_reduction: float = Field(default=0.0, ge=0.0)
     visit_sampling_epsilon: float
     mcts_seed: int | None
     reuse_tree: bool
@@ -170,6 +175,7 @@ SELF_PLAY_SNAPSHOT_FIELDS: tuple[str, ...] = (
     "dirichlet_epsilon",
     "add_noise",
     "use_parent_value_for_unvisited_q",
+    "fpu_reduction",
     "visit_sampling_epsilon",
     "reuse_tree",
     "count_reused_visits",
@@ -201,6 +207,7 @@ class SelfPlaySnapshot(ConfigModel):
     visit_sampling_epsilon: float
     reuse_tree: bool
     # Defaults keep snapshots published by older trainers parseable.
+    fpu_reduction: float = Field(default=0.0, ge=0.0)
     count_reused_visits: bool = False
     min_new_simulations: int = Field(default=0, ge=0)
     max_placements: int

@@ -282,6 +282,7 @@ fn simulate<E: LeafEvaluator>(
             config.c_puct,
             *q_bounds,
             config.use_parent_value_for_unvisited_q,
+            config.fpu_reduction,
         );
         let action_idx = node.valid_actions[action_position];
         let mut expanded_action = false;
@@ -879,7 +880,10 @@ mod tests {
             apply_policy_temperature(&mut policy, temperature);
             let expected = softmax(1.0 / temperature);
             for (got, want) in policy.iter().zip(expected.iter()) {
-                assert!((got - want).abs() < 1e-6, "T={temperature}: {got} vs {want}");
+                assert!(
+                    (got - want).abs() < 1e-6,
+                    "T={temperature}: {got} vs {want}"
+                );
             }
             assert_eq!(policy[4], 0.0);
         }
