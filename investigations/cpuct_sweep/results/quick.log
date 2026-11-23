@@ -1,0 +1,6 @@
+2026-11-23 19:41:27 [info     ] point done                     avg_attack=57.05 c_puct=0.75 seconds=2.5 sem=2.04 sims=300
+2026-11-23 19:41:29 [info     ] point done                     avg_attack=59.15 c_puct=1.5 seconds=1.8 sem=1.45 sims=300
+2026-11-23 19:41:30 [info     ] point done                     avg_attack=59.2 c_puct=3.0 seconds=1.6 sem=1.95 sims=300
+2026-11-23 19:41:36 [info     ] point done                     avg_attack=60.2 c_puct=0.75 seconds=6.0 sem=1.23 sims=1000
+2026-11-23 19:41:42 [info     ] point done                     avg_attack=61.2 c_puct=1.5 seconds=5.7 sem=0.9 sims=1000
+2026-11-23 19:41:48 [info     ] point done                     avg_attack=61.05 c_puct=3.0 seconds=5.6 sem=1.09 sims=1000
