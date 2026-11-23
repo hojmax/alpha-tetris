@@ -71,7 +71,7 @@ Maybe there are better human-comparison sources out there. It would be interesti
 I did two of the items from the list at the bottom of this README, then trained a new run from scratch:
 
 - **Optimal search depth.** I ran Leela Zero's information-gain analysis on the original model. Policy information per visit peaks at ~270 simulations and stays within 90% of the peak between 240 and 542, while the original run used 2000 ([details](investigations/optimal_search_depth/)). The new run uses 500.
-- **Faster inference.** The conv trunk and heads now run natively in Rust instead of through tract, all workers share one copy of the weights, and the tree and move generation got cheaper. At the same 2000 simulations that is ~4–5x more games per second on my M5 Pro.
+- **Faster inference.** The conv trunk and heads now run natively in Rust instead of through tract, all workers share one copy of the weights, and the tree and move generation got cheaper. At the same 2000 simulations that is ~4–5x more games per second on an M5 Pro.
 - **New run.** 18.6 h and 7.3M games, against 108 h and 0.54M games for the original. It ran on a Vast.ai box with 2x EPYC 9654 (184-CPU quota) + RTX 5090. Faster inference, 4x fewer simulations and more CPUs together gave ~80x more games per hour.
 - **Deterministic phase.** 9.1 h and 3.1M more games with 1000 simulations (2x the new run) and greedy self-play (no root noise, no sampled moves), at the already decayed learning rate of 1e-4.
 
